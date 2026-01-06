@@ -17,7 +17,6 @@ import getpass
 import logging
 import os
 import queue
-import sys
 import shutil
 import subprocess
 import threading
@@ -82,6 +81,7 @@ class CommandExecutor:
 
     def __init__(self, dry_run: bool = True) -> None:
         self.dry_run = dry_run
+        self.sudo_password: Optional[str] = None
 
     def execute(
         self,
@@ -101,16 +101,37 @@ class CommandExecutor:
         Returns:
             True if command succeeded, False otherwise
         """
+        input_data = None
         if sudo:
             if not check_command_exists("sudo"):
                 logger.error("Sudo command not found, cannot execute privileged task.")
                 return False
 
-            # Use non-interactive mode if no terminal is attached to prevent hanging
-            if not sys.stdin or not sys.stdin.isatty():
-                full_command = ["sudo", "-n"] + command
-            else:
+            # Check if we already have sudo privileges
+            has_sudo = (
+                subprocess.call(
+                    ["sudo", "-n", "-v"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                == 0
+            )
+
+            if has_sudo:
                 full_command = ["sudo"] + command
+            else:
+                if not self.sudo_password and gui_input_handler:
+                    self.sudo_password = gui_input_handler.request_password(
+                        "Authentication Required", "Enter password for system cleanup:"
+                    )
+
+                if self.sudo_password:
+                    # Use -S to read password from stdin, -p '' to suppress prompt
+                    full_command = ["sudo", "-S", "-p", ""] + command
+                    input_data = (self.sudo_password + "\n").encode()
+                else:
+                    # Fallback to non-interactive fail if no password provided
+                    full_command = ["sudo", "-n"] + command
         else:
             full_command = command
 
@@ -127,7 +148,9 @@ class CommandExecutor:
             return True
 
         try:
-            subprocess.run(full_command, shell=shell, check=True, timeout=timeout)
+            subprocess.run(
+                full_command, shell=shell, check=True, timeout=timeout, input=input_data
+            )
             return True
         except subprocess.CalledProcessError as error:
             logger.error(f"Command failed ({command_str}): {error}")
@@ -214,7 +237,7 @@ class PackageCleaner:
 
                 if not self.executor.dry_run:
                     response = safe_input(
-                        "Remove the orphaned packages? [y/N] ",
+                        "Remove the orphaned packages?",
                         ["y", "n", ""],
                         default="n",
                     )
@@ -261,7 +284,7 @@ class PackageCleaner:
 
                 if not self.executor.dry_run:
                     response = safe_input(
-                        "Clean package cache? [y/N] ", ["y", "n", ""], default="n"
+                        "Clean package cache?", ["y", "n", ""], default="n"
                     )
                     if response == "y":
                         self.executor.execute(
@@ -341,7 +364,7 @@ class ConfigCleaner:
             return
 
         response = safe_input(
-            "Remove ANY old configuration files? [y/N] ", ["y", "n", ""], default="n"
+            "Remove ANY old configuration files?", ["y", "n", ""], default="n"
         )
 
         if response != "y":
@@ -621,7 +644,7 @@ class AppConfigCleaner:
             return
 
         response = safe_input(
-            "Remove any of these configurations? [y/N] ", ["y", "n", ""], default="n"
+            "Remove any of these configurations?", ["y", "n", ""], default="n"
         )
         if response != "y":
             logger.info("Keeping all orphaned configurations")
@@ -629,9 +652,7 @@ class AppConfigCleaner:
 
         for path, _ in orphaned_configs:
             if path.exists():
-                response = safe_input(
-                    f"Remove {path}? [y/N] ", ["y", "n", ""], default="n"
-                )
+                response = safe_input(f"Remove {path}?", ["y", "n", ""], default="n")
                 if response == "y":
                     try:
                         self.executor.execute(["rm", "-rf", str(path)], sudo=False)
@@ -658,7 +679,7 @@ class SystemCacheCleaner:
             return
 
         response = safe_input(
-            "Clean system temporary files in /tmp? [y/N] ",
+            "Clean system temporary files in /tmp?",
             ["y", "n", ""],
             default="n",
         )
@@ -700,7 +721,7 @@ class SystemCacheCleaner:
             return
 
         response = safe_input(
-            f"Clean wastebasket (empty trash) for user {self.current_user}? [y/N] ",
+            f"Clean wastebasket (empty trash) for user {self.current_user}?",
             ["y", "n", ""],
             default="n",
         )
@@ -1008,6 +1029,66 @@ class GMessageBox:
             icon="question",
         )
 
+    @staticmethod
+    def askpassword(title: str, message: str) -> Optional[str]:
+        dialog = tk.Toplevel()
+        root = dialog.master
+        dialog.title(title)
+        if root:
+            dialog.transient(cast(tk.Wm, root))
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        font_family = "Segoe UI" if os.name == "nt" else "Helvetica"
+        font_size = 9 if os.name == "nt" else 10
+        font_style = (font_family, font_size)
+
+        main_frame = ttk.Frame(dialog, padding=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(main_frame, text=message, font=font_style, wraplength=300).pack(
+            fill=tk.X, pady=(0, 10)
+        )
+
+        password_var = tk.StringVar()
+        entry = ttk.Entry(main_frame, show="*", textvariable=password_var, width=30)
+        entry.pack(fill=tk.X, pady=(0, 20))
+        entry.focus_set()
+
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X)
+        container = ttk.Frame(btn_frame)
+        container.pack(anchor=tk.CENTER)
+
+        result = None
+
+        def on_ok():
+            nonlocal result
+            result = password_var.get()
+            dialog.destroy()
+
+        def on_cancel():
+            dialog.destroy()
+
+        ttk.Button(container, text="OK", command=on_ok, width=10, cursor="hand2").pack(
+            side=tk.LEFT, padx=5
+        )
+        ttk.Button(
+            container, text="Cancel", command=on_cancel, width=10, cursor="hand2"
+        ).pack(side=tk.LEFT, padx=5)
+
+        dialog.bind("<Return>", lambda e: on_ok())
+        dialog.bind("<Escape>", lambda e: on_cancel())
+
+        dialog.update_idletasks()
+        if root:
+            x = root.winfo_x() + (root.winfo_width() - dialog.winfo_reqwidth()) // 2
+            y = root.winfo_y() + (root.winfo_height() - dialog.winfo_reqheight()) // 2
+            dialog.geometry(f"+{x}+{y}")
+
+        dialog.wait_window()
+        return result
+
 
 class GuiInputHandler:
     """Handles user input requests via GUI dialogs in thread-safe manner."""
@@ -1036,6 +1117,14 @@ class GuiInputHandler:
         self.event.wait()
         return self.result
 
+    def request_password(self, title: str, prompt: str) -> Optional[str]:
+        """Requests password from user via modal dialog."""
+        self.event.clear()
+        self.result = None
+        self.root.after(0, lambda: self._ask_password_dialog(title, prompt))
+        self.event.wait()
+        return self.result
+
     def _ask_dialog(
         self, prompt: str, valid_responses: List[str], default: Optional[str]
     ) -> None:
@@ -1052,6 +1141,12 @@ class GuiInputHandler:
         except Exception as error:
             logger.error(f"Error displaying dialog: {error}")
             self.result = default
+        finally:
+            self.event.set()
+
+    def _ask_password_dialog(self, title: str, prompt: str) -> None:
+        try:
+            self.result = GMessageBox.askpassword(title, prompt)
         finally:
             self.event.set()
 
