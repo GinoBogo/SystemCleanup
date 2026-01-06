@@ -17,6 +17,7 @@ import getpass
 import logging
 import os
 import queue
+import sys
 import shutil
 import subprocess
 import threading
@@ -100,7 +101,19 @@ class CommandExecutor:
         Returns:
             True if command succeeded, False otherwise
         """
-        full_command = ["sudo"] + command if sudo else command
+        if sudo:
+            if not check_command_exists("sudo"):
+                logger.error("Sudo command not found, cannot execute privileged task.")
+                return False
+
+            # Use non-interactive mode if no terminal is attached to prevent hanging
+            if not sys.stdin or not sys.stdin.isatty():
+                full_command = ["sudo", "-n"] + command
+            else:
+                full_command = ["sudo"] + command
+        else:
+            full_command = command
+
         command_str = (
             " ".join(full_command)
             if not shell
@@ -660,7 +673,20 @@ class SystemCacheCleaner:
             return
 
         self.executor.execute(
-            ["find", "/tmp", "-xdev", "-type", "f", "!", "-name", ".*", "-atime", "+7", "-delete"], sudo=True
+            [
+                "find",
+                "/tmp",
+                "-xdev",
+                "-type",
+                "f",
+                "!",
+                "-name",
+                ".*",
+                "-atime",
+                "+7",
+                "-delete",
+            ],
+            sudo=True,
         )
 
     def clean_user_wastebasket(self) -> None:
