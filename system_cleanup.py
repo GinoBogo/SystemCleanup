@@ -218,7 +218,23 @@ class PackageCleaner:
         log_step("Cleaning orphaned packages")
 
         if self.package_manager == "apt":
-            self.executor.execute(["apt", "autoremove", "--purge", "-y"], sudo=True)
+            if self.executor.dry_run:
+                logger.info("Simulating orphaned package removal (Dry Run):")
+                try:
+                    result = subprocess.run(
+                        ["apt", "autoremove", "--purge", "--dry-run"],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    if result.stdout:
+                        logger.info(result.stdout.strip())
+                    if result.stderr:
+                        logger.warning(result.stderr.strip())
+                except Exception as error:
+                    logger.error(f"APT simulation failed: {error}")
+            else:
+                self.executor.execute(["apt", "autoremove", "--purge", "-y"], sudo=True)
 
         elif self.package_manager == "pacman":
             try:
