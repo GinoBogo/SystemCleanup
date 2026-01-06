@@ -10,7 +10,7 @@ code.
 
 Author: Gino Bogo
 License: MIT
-Version: 1.0
+Version: 1.1
 """
 
 import getpass
@@ -73,6 +73,14 @@ def format_size_bytes(size_bytes: int) -> str:
     return f"{size:.1f} PB"
 
 
+def sanitize_path(path_str: str) -> str:
+    """Sanitizes a path string to prevent shell injection."""
+    # Remove newlines, semicolons, and other shell metacharacters
+    return (
+        path_str.replace("\n", "").replace(";", "").replace("`", "").replace("$(", "")
+    )
+
+
 # ==============================================================================
 # CORE CLASSES
 # ==============================================================================
@@ -83,7 +91,57 @@ class CommandExecutor:
 
     def __init__(self, dry_run: bool = True) -> None:
         self.dry_run = dry_run
-        self.sudo_password: Optional[str] = None
+        self._sudo_password: Optional[bytes] = (
+            None  # Store as bytes for better security
+        )
+        self._password_attempts = 0
+        self._max_password_attempts = 3
+
+    def _clear_password(self) -> None:
+        """Securely clears the password from memory."""
+        if self._sudo_password:
+            # Overwrite the bytes with zeros before clearing
+            import ctypes
+
+            ctypes.memset(
+                ctypes.c_char_p(self._sudo_password), 0, len(self._sudo_password)
+            )
+            self._sudo_password = None
+
+    def _get_sudo_password(self) -> Optional[bytes]:
+        """Gets sudo password from GUI or console with security measures."""
+        if self._sudo_password is not None:
+            return self._sudo_password
+
+        if self._password_attempts >= self._max_password_attempts:
+            logger.error("Too many failed password attempts")
+            return None
+
+        if gui_input_handler:
+            password = gui_input_handler.request_password(
+                "Authentication Required", "Enter password for system cleanup:"
+            )
+            if password:
+                self._sudo_password = password.encode("utf-8")
+                self._password_attempts += 1
+                return self._sudo_password
+        else:
+            # CLI mode - use getpass for secure input
+            try:
+                import sys
+
+                if sys.stdin.isatty():
+                    password = getpass.getpass("Enter sudo password: ")
+                    if password:
+                        self._sudo_password = password.encode("utf-8")
+                        self._password_attempts += 1
+                        return self._sudo_password
+                else:
+                    logger.error("No terminal available for password input")
+            except Exception as e:
+                logger.error(f"Failed to get password: {e}")
+
+        return None
 
     def execute(
         self,
@@ -122,15 +180,31 @@ class CommandExecutor:
             if has_sudo:
                 full_command = ["sudo"] + command
             else:
-                if not self.sudo_password and gui_input_handler:
-                    self.sudo_password = gui_input_handler.request_password(
-                        "Authentication Required", "Enter password for system cleanup:"
-                    )
-
-                if self.sudo_password:
-                    # Use -S to read password from stdin, -p '' to suppress prompt
-                    full_command = ["sudo", "-S", "-p", ""] + command
-                    input_data = (self.sudo_password + "\n").encode()
+                password = self._get_sudo_password()
+                if password:
+                    # Use sudo with askpass for more secure password handling
+                    askpass_script = self._create_askpass_script(password)
+                    if askpass_script:
+                        env = os.environ.copy()
+                        env["SUDO_ASKPASS"] = askpass_script
+                        full_command = ["sudo", "-A", "-p", ""] + command
+                        # Clean up the temporary askpass script after use
+                        try:
+                            result = self._execute_with_env(
+                                full_command, env, shell, timeout
+                            )
+                            os.unlink(askpass_script)
+                            return result
+                        except Exception:
+                            try:
+                                os.unlink(askpass_script)
+                            except OSError:
+                                pass
+                            return False
+                    else:
+                        # Fallback to stdin method (less secure)
+                        full_command = ["sudo", "-S", "-p", ""] + command
+                        input_data = password + b"\n"
                 else:
                     # Fallback to non-interactive fail if no password provided
                     full_command = ["sudo", "-n"] + command
@@ -163,6 +237,45 @@ class CommandExecutor:
         except Exception as error:
             logger.error(f"Unexpected error running command ({command_str}): {error}")
         return False
+
+    def _create_askpass_script(self, password: bytes) -> Optional[str]:
+        """Creates a temporary askpass script for sudo -A."""
+        try:
+            import tempfile
+
+            fd, path = tempfile.mkstemp(prefix="sudo_askpass_", text=True)
+            with os.fdopen(fd, "w") as f:
+                f.write(f"""#!/bin/sh
+echo '{password.decode("utf-8", errors="ignore")}'
+""")
+            os.chmod(path, 0o700)
+            return path
+        except Exception as e:
+            logger.warning(f"Failed to create askpass script: {e}")
+            return None
+
+    def _execute_with_env(
+        self,
+        command: List[str],
+        env: Dict[str, str],
+        shell: bool,
+        timeout: Optional[int],
+    ) -> bool:
+        """Executes command with custom environment."""
+        command_str = " ".join(command)
+        try:
+            subprocess.run(command, shell=shell, check=True, timeout=timeout, env=env)
+            return True
+        except subprocess.CalledProcessError as error:
+            logger.error(f"Command failed ({command_str}): {error}")
+            return False
+        except Exception as error:
+            logger.error(f"Unexpected error: {error}")
+            return False
+
+    def cleanup(self) -> None:
+        """Cleans up resources, including passwords."""
+        self._clear_password()
 
 
 class SystemDetector:
@@ -227,12 +340,16 @@ class PackageCleaner:
                         ["apt", "autoremove", "--purge", "--dry-run"],
                         capture_output=True,
                         text=True,
-                        check=False,
+                        check=True,  # Changed to check=True to catch errors
                     )
                     if result.stdout:
                         logger.info(result.stdout.strip())
                     if result.stderr:
                         logger.warning(result.stderr.strip())
+                except subprocess.CalledProcessError as error:
+                    logger.error(
+                        f"APT simulation failed with exit code {error.returncode}: {error.stderr}"
+                    )
                 except Exception as error:
                     logger.error(f"APT simulation failed: {error}")
             else:
@@ -280,8 +397,13 @@ class PackageCleaner:
         log_step("Cleaning package cache")
 
         if self.package_manager == "apt":
-            self.executor.execute(["apt", "autoclean"], sudo=True)
-            self.executor.execute(["apt", "clean"], sudo=True)
+            if self.executor.dry_run:
+                logger.info(
+                    "[DRY-RUN] Would clean APT package cache (autoclean + clean)"
+                )
+            else:
+                self.executor.execute(["apt", "autoclean"], sudo=True)
+                self.executor.execute(["apt", "clean"], sudo=True)
 
         elif self.package_manager == "pacman":
             try:
@@ -356,7 +478,8 @@ class ConfigCleaner:
         except Exception as error:
             logger.error(f"Error searching configuration files: {error}")
 
-        return list(set(config_files))[:30]  # Limit to 30 files for safety
+        # Remove duplicates but keep all files (removed arbitrary 30-file limit)
+        return list(set(config_files))
 
     def clean_old_configurations(self) -> None:
         """Cleans old configuration files with user confirmation."""
@@ -369,8 +492,10 @@ class ConfigCleaner:
             return
 
         logger.info(f"Old configuration files found ({len(config_files)}):")
-        for file_path in config_files:
+        for file_path in config_files[:50]:  # Show first 50 files only
             logger.info(f"  {file_path}")
+        if len(config_files) > 50:
+            logger.info(f"  ... and {len(config_files) - 50} more files")
 
         logger.warning(
             "IMPORTANT: Some .pacnew and .pacsave files may contain important updates."
@@ -402,7 +527,9 @@ class ConfigCleaner:
         for file_path in config_files:
             if file_path.exists():
                 try:
-                    self.executor.execute(["rm", "-v", str(file_path)], sudo=True)
+                    self.executor.execute(
+                        ["rm", "-v", sanitize_path(str(file_path))], sudo=True
+                    )
                 except Exception as error:
                     logger.error(f"Failed to remove {file_path}: {error}")
             else:
@@ -423,6 +550,8 @@ class AppConfigCleaner:
         self._deep_scan_cache: Optional[List[str]] = None
         self._flatpak_packages_cache: Optional[List[str]] = None
         self._snap_packages_cache: Optional[List[str]] = None
+        self._installed_packages_cache: Optional[List[str]] = None
+        self._installed_packages_lower_cache: Optional[set] = None
 
     def get_installed_packages(self) -> List[str]:
         """Retrieves list of currently installed packages.
@@ -430,6 +559,9 @@ class AppConfigCleaner:
         Returns:
             List of installed package names
         """
+        if self._installed_packages_cache is not None:
+            return self._installed_packages_cache
+
         try:
             if self.package_manager == "apt":
                 result = subprocess.run(
@@ -443,13 +575,26 @@ class AppConfigCleaner:
                     ["pacman", "-Qq"], capture_output=True, text=True, check=True
                 )
             else:
+                self._installed_packages_cache = []
                 return []
 
-            return result.stdout.strip().split("\n")
+            packages = result.stdout.strip().split("\n")
+            self._installed_packages_cache = packages
+            return packages
 
         except Exception as error:
             logger.error(f"Error retrieving installed packages: {error}")
+            self._installed_packages_cache = []
             return []
+
+    def _get_installed_packages_lower(self) -> set:
+        """Gets installed packages as lowercase set for efficient matching."""
+        if self._installed_packages_lower_cache is not None:
+            return self._installed_packages_lower_cache
+
+        packages = self.get_installed_packages()
+        self._installed_packages_lower_cache = {pkg.lower() for pkg in packages}
+        return self._installed_packages_lower_cache
 
     def get_flatpak_packages(self) -> List[str]:
         """Retrieves list of currently installed Flatpak packages."""
@@ -520,7 +665,7 @@ class AppConfigCleaner:
             return self._deep_scan_cache
 
         logger.info("Performing deep scan of home directory for applications...")
-        files_found = []
+        files_found = set()
         home = Path.home()
         exclude_dirs = {".cache", ".config", ".local", ".git", "__pycache__"}
 
@@ -529,10 +674,95 @@ class AppConfigCleaner:
                 d for d in dirs if d not in exclude_dirs and not d.startswith(".")
             ]
             for file in files:
-                files_found.append(file.lower())
+                file_path = os.path.join(root, file)
+                # Check for AppImages or executable files
+                if file.lower().endswith(".appimage") or os.access(file_path, os.X_OK):
+                    files_found.add(file.lower())
 
-        self._deep_scan_cache = files_found
-        return files_found
+        # Explicitly scan ~/.local/bin which is otherwise excluded
+        local_bin = home / ".local" / "bin"
+        if local_bin.exists():
+            for root, _, files in os.walk(local_bin):
+                for file in files:
+                    if os.access(os.path.join(root, file), os.X_OK):
+                        files_found.add(file.lower())
+
+        self._deep_scan_cache = list(files_found)
+        return self._deep_scan_cache
+
+    def _is_package_installed(self, item_name: str, item_path: Path) -> bool:
+        """Checks if a directory corresponds to an installed package."""
+        item_lower = item_name.lower()
+        installed_lower = self._get_installed_packages_lower()
+
+        # 1. Exact match (case-insensitive)
+        if item_lower in installed_lower:
+            return True
+
+        # 2. Common pattern: package "python-foo" creates dir "foo"
+        for pkg in installed_lower:
+            if "-" in pkg and item_lower == pkg.split("-", 1)[-1]:
+                return True
+            # Handle lib prefixes
+            if pkg.startswith("lib") and item_lower == pkg[3:]:
+                return True
+
+        # 3. Check if command exists in PATH (only check once)
+        if check_command_exists(item_name) or check_command_exists(item_lower):
+            return True
+
+        # 4. Deep Scan checks
+        if self.deep_scan:
+            # Check Flatpak packages
+            flatpak_packages = self.get_flatpak_packages()
+            if flatpak_packages and item_lower in flatpak_packages:
+                return True
+
+            # Check Snap packages
+            snap_packages = self.get_snap_packages()
+            if snap_packages and item_lower in snap_packages:
+                return True
+
+            # Check for AppImages/binaries
+            deep_files = self._get_deep_scan_files()
+            if item_lower in deep_files:
+                return True
+
+            # Fuzzy match for versioned AppImages/binaries
+            for file_name in deep_files:
+                if file_name.startswith(item_lower):
+                    remainder = file_name[len(item_lower) :]
+                    if not remainder or remainder[0] in ("-", ".", "_"):
+                        return True
+
+        return False
+
+    def _calculate_directory_size(self, directory: Path) -> int:
+        """Calculates directory size efficiently."""
+        try:
+            # Use du command for large directories (more efficient)
+            if directory.is_dir():
+                result = subprocess.run(
+                    ["du", "-sb", str(directory)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode == 0:
+                    size_str = result.stdout.split()[0]
+                    return int(size_str)
+
+            # Fallback to Python method
+            total_size = 0
+            for file_path in directory.rglob("*"):
+                if file_path.is_file():
+                    try:
+                        total_size += file_path.stat().st_size
+                    except (OSError, PermissionError):
+                        continue
+            return total_size
+        except Exception:
+            return 0
 
     def find_orphaned_configurations(self) -> List[Tuple[Path, int]]:
         """Scans configuration directories for folders not matching installed packages.
@@ -548,9 +778,6 @@ class AppConfigCleaner:
             Path.home() / ".cache",
         ]
 
-        installed_packages = self.get_installed_packages()
-        flatpak_packages = self.get_flatpak_packages() if self.deep_scan else []
-        snap_packages = self.get_snap_packages() if self.deep_scan else []
         orphaned_configs = []
 
         skip_directories = {
@@ -575,7 +802,17 @@ class AppConfigCleaner:
                 continue
 
             try:
-                for item in root_directory.iterdir():
+                items = list(root_directory.iterdir())
+                total_items = len(items)
+                processed = 0
+
+                for item in items:
+                    processed += 1
+                    if processed % 20 == 0:  # Log progress every 20 items
+                        logger.info(
+                            f"  Scanning {root_directory}: {processed}/{total_items} items..."
+                        )
+
                     if (
                         not item.is_dir()
                         or item.name.lower() in skip_directories
@@ -583,49 +820,8 @@ class AppConfigCleaner:
                     ):
                         continue
 
-                    # Check if item matches any installed package
-                    is_found = any(
-                        pkg in item.name or item.name in pkg
-                        for pkg in installed_packages
-                        if pkg
-                    )
-
-                    # Check if command exists in PATH
-                    if not is_found:
-                        if check_command_exists(item.name) or check_command_exists(
-                            item.name.lower()
-                        ):
-                            is_found = True
-
-                    # Deep Scan (Slow, Optional)
-                    if not is_found and self.deep_scan:
-                        # Check against Flatpak packages
-                        if flatpak_packages and any(
-                            pkg in item.name.lower() for pkg in flatpak_packages
-                        ):
-                            is_found = True
-
-                        # Check against Snap packages
-                        if (
-                            not is_found
-                            and snap_packages
-                            and any(pkg in item.name.lower() for pkg in snap_packages)
-                        ):
-                            is_found = True
-
-                        # Check for AppImages/binaries in home directory
-                        if not is_found:
-                            deep_files = self._get_deep_scan_files()
-                            if any(item.name.lower() in f for f in deep_files):
-                                is_found = True
-
-                    if not is_found:
-                        try:
-                            size_bytes = sum(
-                                f.stat().st_size for f in item.rglob("*") if f.is_file()
-                            )
-                        except Exception:
-                            size_bytes = 0
+                    if not self._is_package_installed(item.name, item):
+                        size_bytes = self._calculate_directory_size(item)
                         orphaned_configs.append((item, size_bytes))
 
             except Exception as error:
@@ -673,12 +869,22 @@ class AppConfigCleaner:
                 response = safe_input(f"Remove {path}?", ["y", "n", ""], default="n")
                 if response == "y":
                     try:
-                        self.executor.execute(["rm", "-rf", str(path)], sudo=False)
+                        self.executor.execute(
+                            ["rm", "-rf", sanitize_path(str(path))], sudo=False
+                        )
                         logger.info(f"Removed {path}")
                     except Exception as error:
                         logger.error(f"Failed to remove {path}: {error}")
                 else:
                     logger.info(f"Kept {path}")
+
+    def clear_caches(self) -> None:
+        """Clears internal caches to free memory."""
+        self._deep_scan_cache = None
+        self._flatpak_packages_cache = None
+        self._snap_packages_cache = None
+        self._installed_packages_cache = None
+        self._installed_packages_lower_cache = None
 
 
 class SystemCacheCleaner:
@@ -881,11 +1087,17 @@ class SystemCleanup:
         if tasks.get("wastebasket"):
             self.cache_cleaner.clean_user_wastebasket()
 
+        # Clear caches to free memory
+        self.app_config_cleaner.clear_caches()
+
         self.show_disk_usage()
         logger.info("System cleanup completed")
 
         if self.dry_run:
             logger.info("This was a dry-run. No changes were made.")
+
+        # Cleanup resources
+        self.executor.cleanup()
 
 
 # ==============================================================================
@@ -1082,8 +1294,15 @@ class GMessageBox:
 
         def on_ok():
             nonlocal result
-            result = password_var.get()
-            dialog.destroy()
+            password = password_var.get()
+            if password:  # Validate non-empty password
+                result = password
+                dialog.destroy()
+            else:
+                # Show error for empty password
+                from tkinter import messagebox
+
+                messagebox.showerror("Error", "Password cannot be empty")
 
         def on_cancel():
             dialog.destroy()
@@ -1115,6 +1334,7 @@ class GuiInputHandler:
         self.root = root
         self.result = None
         self.event = threading.Event()
+        self.timeout = 30  # seconds
 
     def request(
         self, prompt: str, valid_responses: List[str], default: Optional[str] = None
@@ -1132,7 +1352,14 @@ class GuiInputHandler:
         self.event.clear()
         self.result = None
         self.root.after(0, lambda: self._ask_dialog(prompt, valid_responses, default))
-        self.event.wait()
+
+        # Wait with timeout
+        if not self.event.wait(timeout=self.timeout):
+            logger.warning(
+                f"Input request timed out after {self.timeout} seconds, using default: {default}"
+            )
+            return default
+
         return self.result
 
     def request_password(self, title: str, prompt: str) -> Optional[str]:
@@ -1140,7 +1367,12 @@ class GuiInputHandler:
         self.event.clear()
         self.result = None
         self.root.after(0, lambda: self._ask_password_dialog(title, prompt))
-        self.event.wait()
+
+        # Wait with timeout
+        if not self.event.wait(timeout=self.timeout):
+            logger.warning(f"Password request timed out after {self.timeout} seconds")
+            return None
+
         return self.result
 
     def _ask_dialog(
@@ -1154,8 +1386,17 @@ class GuiInputHandler:
                 answer = GMessageBox.askyesno("Confirmation Required", prompt)
                 self.result = "yes" if answer else "no"
             else:
-                answer = GMessageBox.askyesno("Input Required", prompt)
-                self.result = "y" if answer else "n"
+                # For simple yes/no questions
+                if set(valid_responses) <= {"y", "n", ""}:
+                    answer = GMessageBox.askyesno("Input Required", prompt)
+                    self.result = "y" if answer else "n"
+                else:
+                    # For more complex choices, we need a custom dialog
+                    # For now, use default
+                    logger.warning(
+                        f"Complex choices not yet supported: {valid_responses}"
+                    )
+                    self.result = default
         except Exception as error:
             logger.error(f"Error displaying dialog: {error}")
             self.result = default
@@ -1190,6 +1431,10 @@ class CleanupApp:
         self.root.title("System Cleanup Utility")
         self.root.geometry("800x600")
 
+        # Set global gui_input_handler immediately to avoid circular dependency
+        global gui_input_handler
+        gui_input_handler = GuiInputHandler(self.root)
+
         # Apply theme
         style = ttk.Style()
         style.theme_use("clam")
@@ -1204,10 +1449,6 @@ class CleanupApp:
         )
         handler.setFormatter(formatter)
         logger.addHandler(handler)
-
-        # Setup input handler
-        global gui_input_handler
-        gui_input_handler = GuiInputHandler(self.root)
 
         # Initialize UI
         self.setup_user_interface()
