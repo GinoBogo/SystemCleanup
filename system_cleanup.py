@@ -53,7 +53,9 @@ def safe_input(
         result = gui_input_handler.request(prompt, valid_responses, default)
         if result is not None:
             return result
-    return default if default else ""
+    if default is not None:
+        return default
+    return ""
 
 
 def check_command_exists(command: str) -> bool:
