@@ -4,9 +4,8 @@
 Robust System Cleanup Script for Arch Linux and Ubuntu
 
 Improved error handling, input validation, dry-run mode, safe logging setup with
-colorized console output including cyan step headers, permission checks,
-concurrency and file operation safety, configurability, and modular well-typed
-code.
+colorized log output including cyan step headers, permission checks, concurrency
+and file operation safety, configurability, and modular well-typed code.
 
 Author: Gino Bogo
 License: MIT
@@ -14,6 +13,7 @@ Version: 1.1
 """
 
 import getpass
+import json
 import logging
 import os
 import queue
@@ -1436,7 +1436,13 @@ class CleanupApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("System Cleanup Utility")
-        self.root.geometry("800x600")
+
+        # Load configuration
+        self.config_file = Path(__file__).resolve().parent / "system_cleanup.json"
+        self.config = self.load_config()
+
+        geometry = self.config.get("geometry", "800x600")
+        self.root.geometry(geometry)
 
         # Set global gui_input_handler immediately to avoid circular dependency
         global gui_input_handler
@@ -1460,8 +1466,61 @@ class CleanupApp:
         # Initialize UI
         self.setup_user_interface()
 
+        # Apply saved options
+        self.apply_config_options()
+
         # Start log polling
         self.root.after(100, self.process_log_queue)
+
+        # Bind close event
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def load_config(self) -> Dict[str, Any]:
+        """Loads configuration from JSON file."""
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, "r") as f:
+                    return json.load(f)
+            except Exception as error:
+                logger.warning(f"Failed to load config: {error}")
+        return {}
+
+    def save_config(self) -> None:
+        """Saves current configuration to JSON file."""
+        config = {
+            "geometry": self.root.geometry(),
+            "dry_run": self.dry_run_var.get(),
+            "deep_scan": self.deep_scan_var.get(),
+            "tasks": {k: v.get() for k, v in self.tasks.items()},
+        }
+        try:
+            self.config_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.config_file, "w") as f:
+                json.dump(config, f, indent=4)
+        except Exception as error:
+            logger.error(f"Failed to save config: {error}")
+
+    def apply_config_options(self) -> None:
+        """Applies loaded configuration to UI variables."""
+        if not self.config:
+            return
+
+        if "dry_run" in self.config:
+            self.dry_run_var.set(self.config["dry_run"])
+
+        if "deep_scan" in self.config:
+            self.deep_scan_var.set(self.config["deep_scan"])
+
+        if "tasks" in self.config:
+            saved_tasks = self.config["tasks"]
+            for task, value in saved_tasks.items():
+                if task in self.tasks:
+                    self.tasks[task].set(value)
+
+    def on_close(self) -> None:
+        """Handles application closure."""
+        self.save_config()
+        self.root.destroy()
 
     def setup_user_interface(self) -> None:
         """Sets up all GUI components and layout."""
@@ -1534,7 +1593,7 @@ class CleanupApp:
         ttk.Button(
             button_container,
             text="Exit",
-            command=self.root.quit,
+            command=self.on_close,
             width=11,
             cursor="hand2",
             style="Bold.TButton",
