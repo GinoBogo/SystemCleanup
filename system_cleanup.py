@@ -23,7 +23,7 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
 # ==============================================================================
 # GLOBAL CONSTANTS AND SETUP
@@ -31,6 +31,10 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 
 logger = logging.getLogger("system_cleanup")
 logger.setLevel(logging.INFO)
+
+# Define custom STEP level
+STEP = 25
+logging.addLevelName(STEP, "STEP")
 
 gui_input_handler = None  # Global input handler for GUI mode
 
@@ -42,7 +46,7 @@ gui_input_handler = None  # Global input handler for GUI mode
 
 def log_step(message: str) -> None:
     """Logs a message formatted as a processing step."""
-    logger.info(f"--- STEP: {message} ---")
+    logger.log(STEP, f"--- {message} ---")
 
 
 def safe_input(
@@ -330,7 +334,7 @@ class PackageCleaner:
 
     def clean_orphaned_packages(self) -> None:
         """Cleans orphaned packages specific to the detected package manager."""
-        log_step("Cleaning orphaned packages")
+        log_step("Cleaning Orphaned Packages")
 
         if self.package_manager == "apt":
             if self.executor.dry_run:
@@ -394,7 +398,7 @@ class PackageCleaner:
 
     def clean_package_cache(self) -> None:
         """Cleans the package cache for the detected package manager."""
-        log_step("Cleaning package cache")
+        log_step("Cleaning Package Cache")
 
         if self.package_manager == "apt":
             if self.executor.dry_run:
@@ -483,7 +487,7 @@ class ConfigCleaner:
 
     def clean_old_configurations(self) -> None:
         """Cleans old configuration files with user confirmation."""
-        log_step("Cleaning old configuration files")
+        log_step("Cleaning Old Configurations")
 
         config_files = self.find_old_configuration_files()
 
@@ -547,11 +551,11 @@ class AppConfigCleaner:
         self.executor = executor
         self.package_manager = package_manager
         self.deep_scan = deep_scan
-        self._deep_scan_cache: Optional[List[str]] = None
+        self._deep_scan_cache: Optional[Set[str]] = None
         self._flatpak_packages_cache: Optional[List[str]] = None
         self._snap_packages_cache: Optional[List[str]] = None
         self._installed_packages_cache: Optional[List[str]] = None
-        self._installed_packages_lower_cache: Optional[set] = None
+        self._installed_packages_lower_cache: Optional[Set[str]] = None
 
     def get_installed_packages(self) -> List[str]:
         """Retrieves list of currently installed packages.
@@ -587,7 +591,7 @@ class AppConfigCleaner:
             self._installed_packages_cache = []
             return []
 
-    def _get_installed_packages_lower(self) -> set:
+    def _get_installed_packages_lower(self) -> Set[str]:
         """Gets installed packages as lowercase set for efficient matching."""
         if self._installed_packages_lower_cache is not None:
             return self._installed_packages_lower_cache
@@ -659,7 +663,7 @@ class AppConfigCleaner:
             self._snap_packages_cache = []
             return []
 
-    def _get_deep_scan_files(self) -> List[str]:
+    def _get_deep_scan_files(self) -> Set[str]:
         """Scans home directory for potential application files."""
         if self._deep_scan_cache is not None:
             return self._deep_scan_cache
@@ -687,7 +691,7 @@ class AppConfigCleaner:
                     if os.access(os.path.join(root, file), os.X_OK):
                         files_found.add(file.lower())
 
-        self._deep_scan_cache = list(files_found)
+        self._deep_scan_cache = files_found
         return self._deep_scan_cache
 
     def _is_package_installed(self, item_name: str, item_path: Path) -> bool:
@@ -831,7 +835,7 @@ class AppConfigCleaner:
 
     def clean_orphaned_configurations(self) -> None:
         """Identifies and optionally removes orphaned application configurations."""
-        log_step("Cleaning orphaned application configurations")
+        log_step("Cleaning App Configurations")
 
         orphaned_configs = self.find_orphaned_configurations()
 
@@ -896,7 +900,7 @@ class SystemCacheCleaner:
 
     def clean_system_cache(self) -> None:
         """Cleans system temporary files in /tmp older than 7 days."""
-        log_step("Cleaning system temporary files")
+        log_step("Cleaning System Cache")
 
         if self.executor.dry_run:
             logger.info("[DRY-RUN] Would clean /tmp files older than 7 days")
@@ -936,7 +940,7 @@ class SystemCacheCleaner:
 
     def clean_user_wastebasket(self) -> None:
         """Empties the trash/wastebasket for the current user."""
-        log_step(f"Cleaning wastebasket for user '{self.current_user}'")
+        log_step(f"Cleaning Wastebasket for user '{self.current_user}'")
 
         if self.executor.dry_run:
             logger.info(
@@ -1143,7 +1147,10 @@ class GMessageBox:
 
     @staticmethod
     def _create_dialog(
-        title: str, message: str, buttons: List[tuple], icon: Optional[str] = None
+        title: str,
+        message: str,
+        buttons: List[Tuple[str, Any, bool]],
+        icon: Optional[str] = None,
     ) -> Any:
         dialog = tk.Toplevel()
         root = dialog.master
