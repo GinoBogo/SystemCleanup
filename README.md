@@ -16,6 +16,8 @@ A robust, GUI-based system cleanup tool designed for Arch Linux and Ubuntu/Debia
   - **Wastebasket**: Empties the user's trash.
 - **Safety First**: Includes confirmation dialogs and detailed logging before destructive actions.
 
+![figure_01.png](docs/images/figure_01.png)
+
 ## Requirements
 
 - **Operating System**: Linux (Arch Linux or Ubuntu/Debian derivatives recommended).

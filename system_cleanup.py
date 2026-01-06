@@ -660,7 +660,7 @@ class SystemCacheCleaner:
             return
 
         self.executor.execute(
-            ["find", "/tmp", "-type", "f", "-atime", "+7", "-delete"], sudo=True
+            ["find", "/tmp", "-xdev", "-type", "f", "!", "-name", ".*", "-atime", "+7", "-delete"], sudo=True
         )
 
     def clean_user_wastebasket(self) -> None:
