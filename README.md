@@ -18,6 +18,8 @@ A robust, GUI-based system cleanup tool designed for Arch Linux and Ubuntu/Debia
 
 ![figure_01.png](docs/images/figure_01.png)
 
+![figure_02.png](docs/images/figure_02.png)
+
 ## Requirements
 
 - **Operating System**: Linux (Arch Linux or Ubuntu/Debian derivatives recommended).
