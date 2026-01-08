@@ -12,6 +12,7 @@ License: MIT
 Version: 1.1
 """
 
+import ctypes
 import getpass
 import json
 import logging
@@ -19,11 +20,13 @@ import os
 import queue
 import shutil
 import subprocess
+import sys
+import tempfile
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
-from typing import Any, Dict, List, Optional, Set, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, cast
 
 # ==============================================================================
 # GLOBAL CONSTANTS AND SETUP
@@ -105,8 +108,6 @@ class CommandExecutor:
         """Securely clears the password from memory."""
         if self._sudo_password:
             # Overwrite the bytes with zeros before clearing
-            import ctypes
-
             ctypes.memset(
                 ctypes.c_char_p(self._sudo_password), 0, len(self._sudo_password)
             )
@@ -132,8 +133,6 @@ class CommandExecutor:
         else:
             # CLI mode - use getpass for secure input
             try:
-                import sys
-
                 if sys.stdin.isatty():
                     password = getpass.getpass("Enter sudo password: ")
                     if password:
@@ -245,8 +244,6 @@ class CommandExecutor:
     def _create_askpass_script(self, password: bytes) -> Optional[str]:
         """Creates a temporary askpass script for sudo -A."""
         try:
-            import tempfile
-
             fd, path = tempfile.mkstemp(prefix="sudo_askpass_", text=True)
             with os.fdopen(fd, "w") as f:
                 f.write(f"""#!/bin/sh
@@ -546,11 +543,18 @@ class AppConfigCleaner:
     """Handles cleanup of orphaned application configuration directories."""
 
     def __init__(
-        self, executor: CommandExecutor, package_manager: str, deep_scan: bool = False
+        self,
+        executor: CommandExecutor,
+        package_manager: str,
+        deep_scan: bool = False,
+        dialog_callback: Optional[
+            Callable[[List[Tuple[Path, int]]], List[Path]]
+        ] = None,
     ) -> None:
         self.executor = executor
         self.package_manager = package_manager
         self.deep_scan = deep_scan
+        self.dialog_callback = dialog_callback
         self._deep_scan_cache: Optional[Set[str]] = None
         self._flatpak_packages_cache: Optional[List[str]] = None
         self._snap_packages_cache: Optional[List[str]] = None
@@ -839,6 +843,8 @@ class AppConfigCleaner:
 
         orphaned_configs = self.find_orphaned_configurations()
 
+        logger.info(f"Found {len(orphaned_configs)} potential orphaned configurations")
+
         if not orphaned_configs:
             logger.info("No orphaned application configurations found")
             return
@@ -857,21 +863,20 @@ class AppConfigCleaner:
             "Review carefully as there may be false positives."
         )
 
-        if self.executor.dry_run:
-            logger.info("[DRY-RUN] Would prompt to remove orphaned configurations")
-            return
-
-        response = safe_input(
-            "Remove any of these configurations?", ["y", "n", ""], default="n"
-        )
-        if response != "y":
-            logger.info("Keeping all orphaned configurations")
-            return
-
-        for path, _ in orphaned_configs:
-            if path.exists():
-                response = safe_input(f"Remove {path}?", ["y", "n", ""], default="n")
-                if response == "y":
+        if self.dialog_callback:
+            # Use GUI dialog to select configurations
+            logger.info("Showing GUI dialog for configuration selection")
+            selected_configs = self.dialog_callback(orphaned_configs)
+            logger.info(
+                f"User selected {len(selected_configs)} configurations for removal"
+            )
+            if not selected_configs:
+                logger.info("No configurations selected for removal")
+                return
+            if self.executor.dry_run:
+                logger.info("[DRY-RUN] Would remove the selected configurations")
+            else:
+                for path in selected_configs:
                     try:
                         self.executor.execute(
                             ["rm", "-rf", sanitize_path(str(path))], sudo=False
@@ -879,8 +884,34 @@ class AppConfigCleaner:
                         logger.info(f"Removed {path}")
                     except Exception as error:
                         logger.error(f"Failed to remove {path}: {error}")
-                else:
-                    logger.info(f"Kept {path}")
+        else:
+            # Fallback to text prompts
+            if self.executor.dry_run:
+                logger.info("[DRY-RUN] Would prompt to remove orphaned configurations")
+                return
+
+            response = safe_input(
+                "Remove any of these configurations?", ["y", "n", ""], default="n"
+            )
+            if response != "y":
+                logger.info("Keeping all orphaned configurations")
+                return
+
+            for path, _ in orphaned_configs:
+                if path.exists():
+                    response = safe_input(
+                        f"Remove {path}?", ["y", "n", ""], default="n"
+                    )
+                    if response == "y":
+                        try:
+                            self.executor.execute(
+                                ["rm", "-rf", sanitize_path(str(path))], sudo=False
+                            )
+                            logger.info(f"Removed {path}")
+                        except Exception as error:
+                            logger.error(f"Failed to remove {path}: {error}")
+                    else:
+                        logger.info(f"Kept {path}")
 
     def clear_caches(self) -> None:
         """Clears internal caches to free memory."""
@@ -1001,16 +1032,24 @@ class SystemCacheCleaner:
 class SystemCleanup:
     """Orchestrates the complete system cleanup process."""
 
-    def __init__(self, dry_run: bool = True, deep_scan: bool = False) -> None:
+    def __init__(
+        self,
+        dry_run: bool = True,
+        deep_scan: bool = False,
+        dialog_callback: Optional[
+            Callable[[List[Tuple[Path, int]]], List[Path]]
+        ] = None,
+    ) -> None:
         self.dry_run = dry_run
         self.deep_scan = deep_scan
+        self.dialog_callback = dialog_callback
         self.executor = CommandExecutor(dry_run=dry_run)
         self.distribution = SystemDetector.detect_operating_system()
         self.package_manager = SystemDetector.get_package_manager()
         self.package_cleaner = PackageCleaner(self.executor, self.package_manager)
         self.config_cleaner = ConfigCleaner(self.executor, self.package_manager)
         self.app_config_cleaner = AppConfigCleaner(
-            self.executor, self.package_manager, deep_scan
+            self.executor, self.package_manager, deep_scan, dialog_callback
         )
         self.cache_cleaner = SystemCacheCleaner(self.executor)
 
@@ -1113,12 +1152,19 @@ class GMessageBox:
     """Custom message box with consistent font sizing."""
 
     @staticmethod
+    def _get_font_style(size_offset: int = 0) -> Tuple[str, int]:
+        """Returns the font family and size based on the OS."""
+        family = "Segoe UI" if os.name == "nt" else "Helvetica"
+        base_size = 9 if os.name == "nt" else 10
+        return family, base_size + size_offset
+
+    @staticmethod
     def _draw_icon(canvas: tk.Canvas, icon: str) -> None:
         """Draws the specified icon onto the canvas."""
         # Use text characters for shapes to ensure antialiasing on all platforms
         # Circle: ● (U+25CF), Triangle: ▲ (U+25B2)
 
-        font_family = "Segoe UI" if os.name == "nt" else "Helvetica"
+        font_family, _ = GMessageBox._get_font_style()
 
         if icon == "information":
             # Blue circle with 'i'
@@ -1149,10 +1195,22 @@ class GMessageBox:
     def _create_dialog(
         title: str,
         message: str,
-        buttons: List[tuple],
+        buttons: List[Tuple[str, Any, Any]],
         icon: Optional[str] = None,
         rich_text: bool = False,
     ) -> Any:
+        """Creates and displays a modal dialog.
+
+        Args:
+            title: The title of the dialog window.
+            message: The message text to display.
+            buttons: A list of tuples (text, value, is_default).
+            icon: Optional icon name ('information', 'warning', 'error', 'question').
+            rich_text: Whether to parse simple HTML-like tags in the message.
+
+        Returns:
+            The value associated with the clicked button.
+        """
         dialog = tk.Toplevel()
         root = dialog.master
         dialog.title(title)
@@ -1162,9 +1220,8 @@ class GMessageBox:
         dialog.resizable(False, False)
 
         # Use consistent font styling
-        font_family = "Segoe UI" if os.name == "nt" else "Helvetica"
-        font_size = 9 if os.name == "nt" else 10
-        font_style = (font_family, font_size)
+        font_style = GMessageBox._get_font_style()
+        font_family, font_size = font_style
 
         # Get dialog background color
         bg_color = ttk.Style().lookup("TFrame", "background") or "#f0f0f0"
@@ -1366,6 +1423,7 @@ class GMessageBox:
 
     @staticmethod
     def showinfo(title: str, message: str, rich_text: bool = False) -> None:
+        """Displays an information dialog."""
         GMessageBox._create_dialog(
             title,
             message,
@@ -1376,18 +1434,21 @@ class GMessageBox:
 
     @staticmethod
     def showwarning(title: str, message: str, rich_text: bool = False) -> None:
+        """Displays a warning dialog."""
         GMessageBox._create_dialog(
             title, message, [("OK", None, True)], icon="warning", rich_text=rich_text
         )
 
     @staticmethod
     def showerror(title: str, message: str, rich_text: bool = False) -> None:
+        """Displays an error dialog."""
         GMessageBox._create_dialog(
             title, message, [("OK", None, True)], icon="error", rich_text=rich_text
         )
 
     @staticmethod
     def askyesno(title: str, message: str, rich_text: bool = False) -> Optional[bool]:
+        """Displays a yes/no question dialog."""
         return GMessageBox._create_dialog(
             title,
             message,
@@ -1428,9 +1489,7 @@ class GMessageBox:
         dialog.resizable(False, False)
 
         # Use consistent font styling
-        font_family = "Segoe UI" if os.name == "nt" else "Helvetica"
-        font_size = 9 if os.name == "nt" else 10
-        font_style = (font_family, font_size)
+        font_style = GMessageBox._get_font_style()
 
         main_frame = ttk.Frame(dialog, padding=20)
         main_frame.pack(fill=tk.BOTH, expand=True)
@@ -1581,6 +1640,181 @@ class QueueHandler(logging.Handler):
         self.log_queue.put(message)
 
 
+class ScrollableFrame(tk.Frame):
+    """A scrollable frame widget."""
+
+    def __init__(self, container, *args, **kwargs):
+        kwargs.setdefault("bg", "white")
+        super().__init__(container, *args, **kwargs)
+        self.canvas = tk.Canvas(self, bg="white", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = tk.Frame(self.canvas, bg="white")
+
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")),
+        )
+
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+
+        # Bind mousewheel events when hovering
+        for widget in [self, self.canvas, self.scrollable_frame]:
+            widget.bind("<Enter>", self._bind_mouse)
+            widget.bind("<Leave>", self._unbind_mouse)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+    def _bind_mouse(self, event):
+        """Binds mouse wheel events when entering the frame."""
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-4>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-5>", self._on_mousewheel)
+
+    def _unbind_mouse(self, event):
+        """Unbinds mouse wheel events when leaving the frame."""
+        self.canvas.unbind_all("<MouseWheel>")
+        self.canvas.unbind_all("<Button-4>")
+        self.canvas.unbind_all("<Button-5>")
+
+    def _on_mousewheel(self, event):
+        """Handles mouse wheel scrolling."""
+        if event.num == 4:
+            self.canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self.canvas.yview_scroll(1, "units")
+        elif event.delta:
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+
+class AppConfigsDialog:
+    """Dialog for selecting app configurations to clean."""
+
+    def __init__(self, parent: tk.Tk, configs: List[Tuple[Path, int]]):
+        self.top = tk.Toplevel(parent)
+        self.top.title("Select App Configs to Clean")
+        self.top.geometry("600x400")
+        self.top.minsize(540, 360)
+        self.top.resizable(True, True)
+        self.selected_configs: List[Path] = []
+
+        # Make dialog modal
+        self.top.transient(parent)
+        self.top.grab_set()
+
+        # Main frame
+        main_frame = ttk.Frame(self.top, padding=10)
+        main_frame.pack(fill="both", expand=True)
+
+        # Create style for white background checkboxes
+        style = ttk.Style()
+        style.configure("White.TCheckbutton", background="white")
+
+        # Instructions
+        ttk.Label(
+            main_frame, text="Select the application configurations to remove:"
+        ).pack(anchor="w", pady=(0, 10))
+
+        # Frame for scrollable area
+        scroll_container = tk.Frame(
+            main_frame, borderwidth=1, relief="solid", bg="white"
+        )
+        scroll_container.pack(fill="both", expand=True, padx=1, pady=1)
+
+        # Scrollable frame for checkboxes
+        scroll_frame = ScrollableFrame(scroll_container)
+        scroll_frame.pack(fill="both", expand=True)
+
+        self.check_vars = []
+        for path, size_bytes in configs:
+            var = tk.BooleanVar(value=False)
+            self.check_vars.append((var, path))
+            size_str = format_size_bytes(size_bytes)
+            chk = ttk.Checkbutton(
+                scroll_frame.scrollable_frame,
+                text=f"{path} ({size_str})",
+                variable=var,
+                style="White.TCheckbutton",
+            )
+            chk.pack(anchor="w", pady=2)
+
+        # Buttons
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Button(
+            button_frame,
+            text="Select All",
+            command=self.select_all,
+            width=11,
+            cursor="hand2",
+            style="Bold.TButton",
+        ).pack(side="left", padx=5)
+        ttk.Button(
+            button_frame,
+            text="Deselect All",
+            command=self.deselect_all,
+            width=11,
+            cursor="hand2",
+            style="Bold.TButton",
+        ).pack(side="left", padx=5)
+        ttk.Button(
+            button_frame,
+            text="OK",
+            command=self.on_ok,
+            width=11,
+            cursor="hand2",
+            style="Bold.TButton",
+        ).pack(side="right", padx=5)
+        ttk.Button(
+            button_frame,
+            text="Cancel",
+            command=self.on_cancel,
+            width=11,
+            cursor="hand2",
+            style="Bold.TButton",
+        ).pack(side="right", padx=5)
+
+        # Bind Enter/Escape
+        self.top.bind("<Return>", lambda e: self.on_ok())
+        self.top.bind("<Escape>", lambda e: self.on_cancel())
+
+        # Center dialog
+        self.top.update_idletasks()
+        x = (
+            parent.winfo_x()
+            + (parent.winfo_width() // 2)
+            - (self.top.winfo_width() // 2)
+        )
+        y = (
+            parent.winfo_y()
+            + (parent.winfo_height() // 2)
+            - (self.top.winfo_height() // 2)
+        )
+        self.top.geometry(f"+{x}+{y}")
+
+    def select_all(self):
+        """Selects all configuration items."""
+        for var, _ in self.check_vars:
+            var.set(True)
+
+    def deselect_all(self):
+        """Deselects all configuration items."""
+        for var, _ in self.check_vars:
+            var.set(False)
+
+    def on_ok(self):
+        """Handles OK button click, saving selection."""
+        self.selected_configs = [path for var, path in self.check_vars if var.get()]
+        self.top.destroy()
+
+    def on_cancel(self):
+        """Handles Cancel button click, clearing selection."""
+        self.selected_configs = []
+        self.top.destroy()
+
+
 class CleanupApp:
     """Main Tkinter application class for the System Cleanup Utility."""
 
@@ -1614,6 +1848,10 @@ class CleanupApp:
         handler.setFormatter(formatter)
         logger.addHandler(handler)
 
+        # Setup dialog handling
+        self.pending_dialogs = queue.Queue()
+        self.dialog_result_queue = queue.Queue()
+
         # Initialize UI
         self.setup_user_interface()
 
@@ -1622,6 +1860,9 @@ class CleanupApp:
 
         # Start log polling
         self.root.after(100, self.process_log_queue)
+
+        # Start dialog processing
+        self.root.after(100, self.process_dialogs)
 
         # Bind close event
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -1832,6 +2073,34 @@ class CleanupApp:
 
         self.root.after(100, self.process_log_queue)
 
+    def process_dialogs(self) -> None:
+        """Processes pending dialogs from background threads."""
+        try:
+            while not self.pending_dialogs.empty():
+                dialog_type, data = self.pending_dialogs.get_nowait()
+                if dialog_type == "app_configs":
+                    selected = self._show_app_configs_dialog(data)
+                    self.dialog_result_queue.put(selected)
+        except queue.Empty:
+            pass
+        self.root.after(100, self.process_dialogs)
+
+    def request_app_configs_dialog(self, configs: List[Tuple[Path, int]]) -> List[Path]:
+        """Requests app configs selection dialog from background thread."""
+        logger.info(f"Requesting app configs dialog with {len(configs)} items")
+        self.pending_dialogs.put(("app_configs", configs))
+        selected = self.dialog_result_queue.get()
+        logger.info(f"Dialog returned {len(selected)} selected configs")
+        return selected
+
+    def _show_app_configs_dialog(self, configs: List[Tuple[Path, int]]) -> List[Path]:
+        """Shows dialog for selecting app configurations to clean."""
+        logger.info(f"Showing app configs dialog with {len(configs)} items")
+        dialog = AppConfigsDialog(self.root, configs)
+        self.root.wait_window(dialog.top)
+        logger.info(f"Dialog closed, selected {len(dialog.selected_configs)} configs")
+        return dialog.selected_configs
+
     def perform_cut(self) -> None:
         """Performs cut operation on disabled text widget."""
         try:
@@ -1885,8 +2154,13 @@ class CleanupApp:
         self, dry_run: bool, deep_scan: bool, selected_tasks: Dict[str, bool]
     ) -> None:
         """Executes cleanup logic in background thread."""
+        logger.info(f"Starting cleanup with tasks: {selected_tasks}")
         try:
-            cleanup = SystemCleanup(dry_run=dry_run, deep_scan=deep_scan)
+            cleanup = SystemCleanup(
+                dry_run=dry_run,
+                deep_scan=deep_scan,
+                dialog_callback=self.request_app_configs_dialog,
+            )
             cleanup.run(selected_tasks)
         except Exception as error:
             logger.error(f"Critical error during cleanup: {error}")
