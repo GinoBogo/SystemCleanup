@@ -185,25 +185,34 @@ class CommandExecutor:
             else:
                 password = self._get_sudo_password()
                 if password:
-                    # Use sudo with askpass for more secure password handling
+                    # Use sudo with askpass for more secure password handling.
+                    # The script itself contains no credential — the password is
+                    # passed only through the environment of the child process.
                     askpass_script = self._create_askpass_script(password)
                     if askpass_script:
                         env = os.environ.copy()
                         env["SUDO_ASKPASS"] = askpass_script
+                        # Inject password purely in-memory via environment variable.
+                        env[self._ASKPASS_ENV_VAR] = password.decode(
+                            "utf-8", errors="replace"
+                        )
                         full_command = ["sudo", "-A", "-p", ""] + command
                         # Clean up the temporary askpass script after use
                         try:
                             result = self._execute_with_env(
                                 full_command, env, shell, timeout
                             )
-                            os.unlink(askpass_script)
                             return result
                         except Exception:
+                            return False
+                        finally:
+                            # Always remove the script and wipe the env copy
                             try:
                                 os.unlink(askpass_script)
                             except OSError:
                                 pass
-                            return False
+                            env.pop(self._ASKPASS_ENV_VAR, None)
+                            env.pop("SUDO_ASKPASS", None)
                     else:
                         # Fallback to stdin method (less secure)
                         full_command = ["sudo", "-S", "-p", ""] + command
@@ -241,14 +250,22 @@ class CommandExecutor:
             logger.error(f"Unexpected error running command ({command_str}): {error}")
         return False
 
+    # Name of the private env var used to pass the password to the askpass script.
+    # Using an obscure name reduces the chance of collision with other variables.
+    _ASKPASS_ENV_VAR = "_SUDO_ASKPASS_PASSWD_7f3a"
+
     def _create_askpass_script(self, password: bytes) -> Optional[str]:
-        """Creates a temporary askpass script for sudo -A."""
+        """Creates a temporary askpass script for sudo -A.
+
+        The password is NOT written to the script file. Instead the script reads
+        it from a private environment variable (_ASKPASS_ENV_VAR) that is only
+        injected into the subprocess environment at execution time, so the
+        credential never appears on disk.
+        """
         try:
             fd, path = tempfile.mkstemp(prefix="sudo_askpass_", text=True)
             with os.fdopen(fd, "w") as f:
-                f.write(f"""#!/bin/sh
-echo '{password.decode("utf-8", errors="ignore")}'
-""")
+                f.write(f'#!/bin/sh\nprintf "%s" "${{{self._ASKPASS_ENV_VAR}}}"\n')
             os.chmod(path, 0o700)
             return path
         except Exception as e:
