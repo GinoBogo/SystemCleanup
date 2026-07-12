@@ -557,7 +557,7 @@ class ConfigCleaner:
 
 
 class AppConfigCleaner:
-    """Handles cleanup of orphaned application configuration directories."""
+    """Handles cleanup of orphaned application configuration directories and files."""
 
     def __init__(
         self,
@@ -572,11 +572,14 @@ class AppConfigCleaner:
         self.package_manager = package_manager
         self.deep_scan = deep_scan
         self.dialog_callback = dialog_callback
-        self._deep_scan_cache: Optional[Set[str]] = None
-        self._flatpak_packages_cache: Optional[List[str]] = None
-        self._snap_packages_cache: Optional[List[str]] = None
+        # Caches
         self._installed_packages_cache: Optional[List[str]] = None
         self._installed_packages_lower_cache: Optional[Set[str]] = None
+        self._path_executables_cache: Optional[Set[str]] = None
+        self._desktop_entries_cache: Optional[Dict[str, str]] = None
+        self._flatpak_packages_cache: Optional[List[str]] = None
+        self._snap_packages_cache: Optional[List[str]] = None
+        self._mtime_threshold = 180 * 86400  # 180 days
 
     def get_installed_packages(self) -> List[str]:
         """Retrieves list of currently installed packages.
@@ -621,7 +624,60 @@ class AppConfigCleaner:
         self._installed_packages_lower_cache = {pkg.lower() for pkg in packages}
         return self._installed_packages_lower_cache
 
-    def get_flatpak_packages(self) -> List[str]:
+    def _get_path_executables(self) -> Set[str]:
+        """Caches all executable names in PATH for fast lookup."""
+        if self._path_executables_cache is not None:
+            return self._path_executables_cache
+
+        executables: Set[str] = set()
+        for path_dir in os.environ.get("PATH", "").split(os.pathsep):
+            if not path_dir:
+                continue
+            try:
+                for item in os.listdir(path_dir):
+                    full = os.path.join(path_dir, item)
+                    if os.path.isfile(full) and os.access(full, os.X_OK):
+                        executables.add(item.lower())
+            except (OSError, PermissionError):
+                continue
+
+        self._path_executables_cache = executables
+        return executables
+
+    def _get_desktop_entries(self) -> Dict[str, str]:
+        """Caches all .desktop files and their Exec binaries."""
+        if self._desktop_entries_cache is not None:
+            return self._desktop_entries_cache
+
+        entries: Dict[str, str] = {}
+        data_dirs = [
+            Path.home() / ".local/share/applications",
+            Path("/usr/share/applications"),
+            Path("/usr/local/share/applications"),
+        ]
+
+        for data_dir in data_dirs:
+            if not data_dir.exists():
+                continue
+            for desktop in data_dir.glob("*.desktop"):
+                try:
+                    with open(desktop, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            if line.startswith("Exec="):
+                                binary = line.strip()[5:].split()[0]
+                                # Strip field codes
+                                for code in ("%U", "%F", "%u", "%f", "%i", "%c", "%k"):
+                                    binary = binary.replace(code, "")
+                                binary = binary.strip()
+                                entries[desktop.stem.lower()] = binary
+                                break
+                except Exception:
+                    continue
+
+        self._desktop_entries_cache = entries
+        return entries
+
+    def _get_flatpak_packages(self) -> List[str]:
         """Retrieves list of currently installed Flatpak packages."""
         if self._flatpak_packages_cache is not None:
             return self._flatpak_packages_cache
@@ -655,7 +711,7 @@ class AppConfigCleaner:
             self._flatpak_packages_cache = []
             return []
 
-    def get_snap_packages(self) -> List[str]:
+    def _get_snap_packages(self) -> List[str]:
         """Retrieves list of currently installed Snap packages."""
         if self._snap_packages_cache is not None:
             return self._snap_packages_cache
@@ -684,83 +740,311 @@ class AppConfigCleaner:
             self._snap_packages_cache = []
             return []
 
-    def _get_deep_scan_files(self) -> Set[str]:
-        """Scans home directory for potential application files."""
-        if self._deep_scan_cache is not None:
-            return self._deep_scan_cache
+    def find_broken_symlinks(self, directories: List[Path]) -> List[Path]:
+        """Finds broken symlinks in given directories."""
+        broken: List[Path] = []
+        for directory in directories:
+            if not directory.exists():
+                continue
+            try:
+                for item in directory.rglob("*"):
+                    if item.is_symlink() and not item.exists():
+                        broken.append(item)
+            except (OSError, PermissionError):
+                continue
+        return broken
 
-        logger.info("Performing deep scan of home directory for applications...")
-        files_found = set()
-        home = Path.home()
-        exclude_dirs = {".cache", ".config", ".local", ".git", "__pycache__"}
+    def find_orphaned_desktop_entries(self) -> List[Path]:
+        """Finds .desktop files whose Exec binary no longer exists."""
+        orphaned: List[Path] = []
+        entries = self._get_desktop_entries()
+        path_exes = self._get_path_executables()
 
-        for root, dirs, files in os.walk(home):
-            dirs[:] = [
-                d for d in dirs if d not in exclude_dirs and not d.startswith(".")
-            ]
-            for file in files:
-                file_path = os.path.join(root, file)
-                # Check for AppImages or executable files
-                if file.lower().endswith(".appimage") or os.access(file_path, os.X_OK):
-                    files_found.add(file.lower())
+        for app_name, binary in entries.items():
+            binary_name = os.path.basename(binary).lower()
+            if binary_name not in path_exes and not shutil.which(binary):
+                # Resolve to actual file path (user-local only for safety)
+                for loc in [Path.home() / ".local/share/applications"]:
+                    desktop_file = loc / f"{app_name}.desktop"
+                    if desktop_file.exists():
+                        orphaned.append(desktop_file)
+                        break
+        return orphaned
 
-        # Explicitly scan ~/.local/bin which is otherwise excluded
-        local_bin = home / ".local" / "bin"
-        if local_bin.exists():
-            for root, _, files in os.walk(local_bin):
-                for file in files:
-                    if os.access(os.path.join(root, file), os.X_OK):
-                        files_found.add(file.lower())
+    def find_orphaned_user_services(self) -> List[Path]:
+        """Finds systemd user services with missing binaries."""
+        services_dir = Path.home() / ".config/systemd/user"
+        if not services_dir.exists():
+            return []
 
-        self._deep_scan_cache = files_found
-        return self._deep_scan_cache
+        orphaned: List[Path] = []
+        path_exes = self._get_path_executables()
 
-    def _is_package_installed(self, item_name: str, item_path: Path) -> bool:
-        """Checks if a directory corresponds to an installed package."""
-        item_lower = item_name.lower()
+        for service in services_dir.glob("*.service"):
+            try:
+                with open(service, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if line.startswith("ExecStart="):
+                            binary = line.strip()[10:].split()[0]
+                            binary_name = os.path.basename(binary).lower()
+                            if binary_name not in path_exes and not shutil.which(
+                                binary
+                            ):
+                                orphaned.append(service)
+                            break
+            except Exception:
+                continue
+        return orphaned
+
+    def find_orphaned_flatpak_data(self) -> List[Tuple[Path, int]]:
+        """Finds user data for uninstalled Flatpak apps."""
+        flatpak_data = Path.home() / ".var/app"
+        if not flatpak_data.exists():
+            return []
+
+        try:
+            result = subprocess.run(
+                ["flatpak", "list", "--app", "--columns=application"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            installed = {
+                line.strip() for line in result.stdout.strip().split("\n") if line
+            }
+        except Exception:
+            return []
+
+        orphaned: List[Tuple[Path, int]] = []
+        for app_dir in flatpak_data.iterdir():
+            if app_dir.is_dir() and app_dir.name not in installed:
+                orphaned.append((app_dir, self._calculate_directory_size(app_dir)))
+        return orphaned
+
+    def find_orphaned_snap_data(self) -> List[Tuple[Path, int]]:
+        """Finds user data for removed Snaps."""
+        snap_data = Path.home() / "snap"
+        if not snap_data.exists():
+            return []
+
+        try:
+            result = subprocess.run(
+                ["snap", "list"], capture_output=True, text=True, check=True
+            )
+            lines = result.stdout.strip().split("\n")
+            if len(lines) > 1:
+                installed = {
+                    line.split()[0].strip() for line in lines[1:] if line.strip()
+                }
+            else:
+                installed = set()
+        except Exception:
+            return []
+
+        orphaned: List[Tuple[Path, int]] = []
+        for app_dir in snap_data.iterdir():
+            if app_dir.is_dir() and app_dir.name not in installed:
+                orphaned.append((app_dir, self._calculate_directory_size(app_dir)))
+        return orphaned
+
+    def _is_directory_referenced_by_desktop(self, directory: Path) -> bool:
+        """Checks if directory name matches a .desktop entry with existing binary."""
+        entries = self._get_desktop_entries()
+        dir_name = directory.name.lower()
+        if dir_name in entries:
+            binary = entries[dir_name]
+            binary_name = os.path.basename(binary).lower()
+            if binary_name in self._get_path_executables() or shutil.which(binary):
+                return True
+        return False
+
+    def _is_directory_known_app(self, directory: Path) -> bool:
+        """Multi-signal check if directory belongs to an installed application."""
+        dir_name = directory.name.lower()
         installed_lower = self._get_installed_packages_lower()
 
-        # 1. Exact match (case-insensitive)
-        if item_lower in installed_lower:
+        # 1. Exact or fuzzy package name match
+        if dir_name in installed_lower:
             return True
-
-        # 2. Common pattern: package "python-foo" creates dir "foo"
         for pkg in installed_lower:
-            if "-" in pkg and item_lower == pkg.split("-", 1)[-1]:
+            if "-" in pkg and dir_name == pkg.split("-", 1)[-1]:
                 return True
-            # Handle lib prefixes
-            if pkg.startswith("lib") and item_lower == pkg[3:]:
+            if pkg.startswith("lib") and dir_name == pkg[3:]:
                 return True
 
-        # 3. Check if command exists in PATH (only check once)
-        if check_command_exists(item_name) or check_command_exists(item_lower):
+        # 2. Binary exists in PATH
+        if dir_name in self._get_path_executables():
             return True
 
-        # 4. Deep Scan checks
+        # 3. Referenced by valid .desktop entry
+        if self._is_directory_referenced_by_desktop(directory):
+            return True
+
+        # 4. Deep scan: Flatpak/Snap
         if self.deep_scan:
-            # Check Flatpak packages
-            flatpak_packages = self.get_flatpak_packages()
-            if flatpak_packages and item_lower in flatpak_packages:
+            flatpak = self._get_flatpak_packages()
+            if flatpak and dir_name in flatpak:
                 return True
-
-            # Check Snap packages
-            snap_packages = self.get_snap_packages()
-            if snap_packages and item_lower in snap_packages:
+            snap = self._get_snap_packages()
+            if snap and dir_name in snap:
                 return True
-
-            # Check for AppImages/binaries
-            deep_files = self._get_deep_scan_files()
-            if item_lower in deep_files:
-                return True
-
-            # Fuzzy match for versioned AppImages/binaries
-            for file_name in deep_files:
-                if file_name.startswith(item_lower):
-                    remainder = file_name[len(item_lower) :]
-                    if not remainder or remainder[0] in ("-", ".", "_"):
-                        return True
 
         return False
+
+    def find_orphaned_configs_recursive(
+        self, max_depth: int = 2
+    ) -> List[Tuple[Path, int]]:
+        """Recursively scans config directories up to max_depth for orphaned apps."""
+        config_directories = [
+            Path.home() / ".config",
+            Path.home() / ".local/share",
+            Path.home() / ".local/bin",
+            Path.home() / ".local/lib",
+            Path.home() / ".local/state",
+            Path.home() / ".cache",
+            Path.home() / ".var",
+            Path.home() / ".themes",
+            Path.home() / ".icons",
+            Path.home() / ".fonts",
+            Path.home() / ".mozilla",
+            Path.home() / ".thunderbird",
+            Path.home() / ".steam",
+            Path.home() / ".wine",
+            Path.home() / ".npm",
+            Path.home() / ".cargo",
+            Path.home() / ".gradle",
+            Path.home() / ".java",
+            Path.home() / ".conda",
+        ]
+
+        skip_directories = {
+            "applications",
+            "autostart",
+            "desktop",
+            "documents",
+            "downloads",
+            "fonts",
+            "icons",
+            "mime",
+            "music",
+            "pictures",
+            "public",
+            "templates",
+            "themes",
+            "videos",
+            "Trash",
+            "trash",
+            "flatpak",
+            "repo",
+        }
+
+        orphaned: List[Tuple[Path, int]] = []
+
+        for root_dir in config_directories:
+            if not root_dir.exists():
+                continue
+
+            try:
+                items = list(root_dir.iterdir())
+                total = len(items)
+                processed = 0
+
+                for item in items:
+                    processed += 1
+                    if processed % 20 == 0:
+                        logger.info(
+                            f"  Scanning {root_dir}: {processed}/{total} items..."
+                        )
+
+                    if (
+                        not item.is_dir()
+                        or item.name.lower() in skip_directories
+                        or len(item.name) <= 2
+                    ):
+                        continue
+
+                    # If top-level is known, optionally descend to check for orphaned subdirs
+                    if self._is_directory_known_app(item):
+                        if max_depth > 1:
+                            for sub in item.iterdir():
+                                if not sub.is_dir():
+                                    continue
+                                if not self._is_directory_known_app(sub):
+                                    sub_name = sub.name.lower()
+                                    # Heuristic: skip common data subdirs
+                                    if sub_name in {
+                                        "default",
+                                        "profile",
+                                        "profiles",
+                                        "data",
+                                        "cache",
+                                        "storage",
+                                        "crash",
+                                        "pending",
+                                        "logs",
+                                        "temp",
+                                        "tmp",
+                                    }:
+                                        continue
+                                    size = self._calculate_directory_size(sub)
+                                    if size > 0:
+                                        orphaned.append((sub, size))
+                        continue
+
+                    # Top-level is unknown - likely orphaned
+                    size = self._calculate_directory_size(item)
+                    orphaned.append((item, size))
+
+            except Exception as error:
+                logger.warning(f"Could not scan {root_dir}: {error}")
+
+        return orphaned
+
+    def find_orphaned_configurations(self) -> List[Tuple[Path, int]]:
+        """Aggregates all orphaned configuration detection methods."""
+        all_orphaned: List[Tuple[Path, int]] = []
+
+        # 1. Recursive config scan (primary)
+        all_orphaned.extend(self.find_orphaned_configs_recursive(max_depth=2))
+
+        # 2. Broken symlinks in key user directories
+        broken_link_dirs = [
+            Path.home() / ".local/bin",
+            Path.home() / ".config",
+            Path.home() / ".local/share/applications",
+        ]
+        for link in self.find_broken_symlinks(broken_link_dirs):
+            all_orphaned.append((link, 0))
+
+        # 3. Orphaned .desktop entries
+        for desktop in self.find_orphaned_desktop_entries():
+            all_orphaned.append(
+                (desktop, desktop.stat().st_size if desktop.exists() else 0)
+            )
+
+        # 4. Orphaned systemd user services
+        for service in self.find_orphaned_user_services():
+            all_orphaned.append(
+                (service, service.stat().st_size if service.exists() else 0)
+            )
+
+        # 5. Orphaned Flatpak data (deep scan)
+        if self.deep_scan:
+            all_orphaned.extend(self.find_orphaned_flatpak_data())
+
+            # 6. Orphaned Snap data (deep scan)
+            all_orphaned.extend(self.find_orphaned_snap_data())
+
+        # Deduplicate by absolute path
+        seen: Set[str] = set()
+        deduped: List[Tuple[Path, int]] = []
+        for path, size in all_orphaned:
+            key = str(path.absolute())
+            if key not in seen:
+                seen.add(key)
+                deduped.append((path, size))
+
+        return deduped
 
     def _calculate_directory_size(self, directory: Path) -> int:
         """Calculates directory size efficiently."""
@@ -788,71 +1072,6 @@ class AppConfigCleaner:
             return total_size
         except Exception:
             return 0
-
-    def find_orphaned_configurations(self) -> List[Tuple[Path, int]]:
-        """Scans configuration directories for folders not matching installed packages.
-
-        Returns:
-            List of tuples (path, size_bytes) for orphaned configurations
-        """
-        config_directories = [
-            Path.home() / ".config",
-            Path.home() / ".local" / "share",
-            Path.home() / ".local" / "bin",
-            Path.home() / ".local" / "lib",
-            Path.home() / ".cache",
-        ]
-
-        orphaned_configs = []
-
-        skip_directories = {
-            "applications",
-            "autostart",
-            "desktop",
-            "documents",
-            "downloads",
-            "fonts",
-            "icons",
-            "mime",
-            "music",
-            "pictures",
-            "public",
-            "templates",
-            "themes",
-            "videos",
-        }
-
-        for root_directory in config_directories:
-            if not root_directory.exists():
-                continue
-
-            try:
-                items = list(root_directory.iterdir())
-                total_items = len(items)
-                processed = 0
-
-                for item in items:
-                    processed += 1
-                    if processed % 20 == 0:  # Log progress every 20 items
-                        logger.info(
-                            f"  Scanning {root_directory}: {processed}/{total_items} items..."
-                        )
-
-                    if (
-                        not item.is_dir()
-                        or item.name.lower() in skip_directories
-                        or len(item.name) <= 2
-                    ):
-                        continue
-
-                    if not self._is_package_installed(item.name, item):
-                        size_bytes = self._calculate_directory_size(item)
-                        orphaned_configs.append((item, size_bytes))
-
-            except Exception as error:
-                logger.warning(f"Could not scan {root_directory}: {error}")
-
-        return orphaned_configs
 
     def clean_orphaned_configurations(self) -> None:
         """Identifies and optionally removes orphaned application configurations."""
@@ -895,9 +1114,14 @@ class AppConfigCleaner:
             else:
                 for path in selected_configs:
                     try:
-                        self.executor.execute(
-                            ["rm", "-rf", sanitize_path(str(path))], sudo=False
-                        )
+                        if path.is_dir():
+                            self.executor.execute(
+                                ["rm", "-rf", sanitize_path(str(path))], sudo=False
+                            )
+                        else:
+                            self.executor.execute(
+                                ["rm", "-f", sanitize_path(str(path))], sudo=False
+                            )
                         logger.info(f"Removed {path}")
                     except Exception as error:
                         logger.error(f"Failed to remove {path}: {error}")
@@ -915,15 +1139,20 @@ class AppConfigCleaner:
                 return
 
             for path, _ in orphaned_configs:
-                if path.exists():
+                if path.exists() or path.is_symlink():
                     response = safe_input(
                         f"Remove {path}?", ["y", "n", ""], default="n"
                     )
                     if response == "y":
                         try:
-                            self.executor.execute(
-                                ["rm", "-rf", sanitize_path(str(path))], sudo=False
-                            )
+                            if path.is_dir():
+                                self.executor.execute(
+                                    ["rm", "-rf", sanitize_path(str(path))], sudo=False
+                                )
+                            else:
+                                self.executor.execute(
+                                    ["rm", "-f", sanitize_path(str(path))], sudo=False
+                                )
                             logger.info(f"Removed {path}")
                         except Exception as error:
                             logger.error(f"Failed to remove {path}: {error}")
@@ -932,11 +1161,12 @@ class AppConfigCleaner:
 
     def clear_caches(self) -> None:
         """Clears internal caches to free memory."""
-        self._deep_scan_cache = None
-        self._flatpak_packages_cache = None
-        self._snap_packages_cache = None
         self._installed_packages_cache = None
         self._installed_packages_lower_cache = None
+        self._path_executables_cache = None
+        self._desktop_entries_cache = None
+        self._flatpak_packages_cache = None
+        self._snap_packages_cache = None
 
 
 class SystemCacheCleaner:
