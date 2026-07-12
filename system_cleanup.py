@@ -9,7 +9,7 @@ and file operation safety, configurability, and modular well-typed code.
 
 Author: Gino Bogo
 License: MIT
-Version: 1.1
+Version: 1.2
 """
 
 import ctypes
@@ -565,7 +565,7 @@ class AppConfigCleaner:
         package_manager: str,
         deep_scan: bool = False,
         dialog_callback: Optional[
-            Callable[[List[Tuple[Path, int]]], List[Path]]
+            Callable[[List[Tuple[Path, int, str]]], List[Path]]
         ] = None,
     ) -> None:
         self.executor = executor
@@ -740,23 +740,25 @@ class AppConfigCleaner:
             self._snap_packages_cache = []
             return []
 
-    def find_broken_symlinks(self, directories: List[Path]) -> List[Path]:
+    def find_broken_symlinks(
+        self, directories: List[Path]
+    ) -> List[Tuple[Path, int, str]]:
         """Finds broken symlinks in given directories."""
-        broken: List[Path] = []
+        broken: List[Tuple[Path, int, str]] = []
         for directory in directories:
             if not directory.exists():
                 continue
             try:
                 for item in directory.rglob("*"):
                     if item.is_symlink() and not item.exists():
-                        broken.append(item)
+                        broken.append((item, 0, "Broken Symlinks"))
             except (OSError, PermissionError):
                 continue
         return broken
 
-    def find_orphaned_desktop_entries(self) -> List[Path]:
+    def find_orphaned_desktop_entries(self) -> List[Tuple[Path, int, str]]:
         """Finds .desktop files whose Exec binary no longer exists."""
-        orphaned: List[Path] = []
+        orphaned: List[Tuple[Path, int, str]] = []
         entries = self._get_desktop_entries()
         path_exes = self._get_path_executables()
 
@@ -767,17 +769,20 @@ class AppConfigCleaner:
                 for loc in [Path.home() / ".local/share/applications"]:
                     desktop_file = loc / f"{app_name}.desktop"
                     if desktop_file.exists():
-                        orphaned.append(desktop_file)
+                        size = (
+                            desktop_file.stat().st_size if desktop_file.exists() else 0
+                        )
+                        orphaned.append((desktop_file, size, "Desktop Entries"))
                         break
         return orphaned
 
-    def find_orphaned_user_services(self) -> List[Path]:
+    def find_orphaned_user_services(self) -> List[Tuple[Path, int, str]]:
         """Finds systemd user services with missing binaries."""
         services_dir = Path.home() / ".config/systemd/user"
         if not services_dir.exists():
             return []
 
-        orphaned: List[Path] = []
+        orphaned: List[Tuple[Path, int, str]] = []
         path_exes = self._get_path_executables()
 
         for service in services_dir.glob("*.service"):
@@ -790,13 +795,14 @@ class AppConfigCleaner:
                             if binary_name not in path_exes and not shutil.which(
                                 binary
                             ):
-                                orphaned.append(service)
+                                size = service.stat().st_size if service.exists() else 0
+                                orphaned.append((service, size, "User Services"))
                             break
             except Exception:
                 continue
         return orphaned
 
-    def find_orphaned_flatpak_data(self) -> List[Tuple[Path, int]]:
+    def find_orphaned_flatpak_data(self) -> List[Tuple[Path, int, str]]:
         """Finds user data for uninstalled Flatpak apps."""
         flatpak_data = Path.home() / ".var/app"
         if not flatpak_data.exists():
@@ -815,13 +821,15 @@ class AppConfigCleaner:
         except Exception:
             return []
 
-        orphaned: List[Tuple[Path, int]] = []
+        orphaned: List[Tuple[Path, int, str]] = []
         for app_dir in flatpak_data.iterdir():
             if app_dir.is_dir() and app_dir.name not in installed:
-                orphaned.append((app_dir, self._calculate_directory_size(app_dir)))
+                orphaned.append(
+                    (app_dir, self._calculate_directory_size(app_dir), "Flatpak Data")
+                )
         return orphaned
 
-    def find_orphaned_snap_data(self) -> List[Tuple[Path, int]]:
+    def find_orphaned_snap_data(self) -> List[Tuple[Path, int, str]]:
         """Finds user data for removed Snaps."""
         snap_data = Path.home() / "snap"
         if not snap_data.exists():
@@ -841,10 +849,12 @@ class AppConfigCleaner:
         except Exception:
             return []
 
-        orphaned: List[Tuple[Path, int]] = []
+        orphaned: List[Tuple[Path, int, str]] = []
         for app_dir in snap_data.iterdir():
             if app_dir.is_dir() and app_dir.name not in installed:
-                orphaned.append((app_dir, self._calculate_directory_size(app_dir)))
+                orphaned.append(
+                    (app_dir, self._calculate_directory_size(app_dir), "Snap Data")
+                )
         return orphaned
 
     def _is_directory_referenced_by_desktop(self, directory: Path) -> bool:
@@ -893,7 +903,7 @@ class AppConfigCleaner:
 
     def find_orphaned_configs_recursive(
         self, max_depth: int = 2
-    ) -> List[Tuple[Path, int]]:
+    ) -> List[Tuple[Path, int, str]]:
         """Recursively scans config directories up to max_depth for orphaned apps."""
         config_directories = [
             Path.home() / ".config",
@@ -938,7 +948,7 @@ class AppConfigCleaner:
             "repo",
         }
 
-        orphaned: List[Tuple[Path, int]] = []
+        orphaned: List[Tuple[Path, int, str]] = []
 
         for root_dir in config_directories:
             if not root_dir.exists():
@@ -988,21 +998,23 @@ class AppConfigCleaner:
                                         continue
                                     size = self._calculate_directory_size(sub)
                                     if size > 0:
-                                        orphaned.append((sub, size))
+                                        orphaned.append(
+                                            (sub, size, "Orphaned Directories")
+                                        )
                         continue
 
                     # Top-level is unknown - likely orphaned
                     size = self._calculate_directory_size(item)
-                    orphaned.append((item, size))
+                    orphaned.append((item, size, "Orphaned Directories"))
 
             except Exception as error:
                 logger.warning(f"Could not scan {root_dir}: {error}")
 
         return orphaned
 
-    def find_orphaned_configurations(self) -> List[Tuple[Path, int]]:
+    def find_orphaned_configurations(self) -> List[Tuple[Path, int, str]]:
         """Aggregates all orphaned configuration detection methods."""
-        all_orphaned: List[Tuple[Path, int]] = []
+        all_orphaned: List[Tuple[Path, int, str]] = []
 
         # 1. Recursive config scan (primary)
         all_orphaned.extend(self.find_orphaned_configs_recursive(max_depth=2))
@@ -1013,20 +1025,13 @@ class AppConfigCleaner:
             Path.home() / ".config",
             Path.home() / ".local/share/applications",
         ]
-        for link in self.find_broken_symlinks(broken_link_dirs):
-            all_orphaned.append((link, 0))
+        all_orphaned.extend(self.find_broken_symlinks(broken_link_dirs))
 
         # 3. Orphaned .desktop entries
-        for desktop in self.find_orphaned_desktop_entries():
-            all_orphaned.append(
-                (desktop, desktop.stat().st_size if desktop.exists() else 0)
-            )
+        all_orphaned.extend(self.find_orphaned_desktop_entries())
 
         # 4. Orphaned systemd user services
-        for service in self.find_orphaned_user_services():
-            all_orphaned.append(
-                (service, service.stat().st_size if service.exists() else 0)
-            )
+        all_orphaned.extend(self.find_orphaned_user_services())
 
         # 5. Orphaned Flatpak data (deep scan)
         if self.deep_scan:
@@ -1037,12 +1042,12 @@ class AppConfigCleaner:
 
         # Deduplicate by absolute path
         seen: Set[str] = set()
-        deduped: List[Tuple[Path, int]] = []
-        for path, size in all_orphaned:
+        deduped: List[Tuple[Path, int, str]] = []
+        for path, size, category in all_orphaned:
             key = str(path.absolute())
             if key not in seen:
                 seen.add(key)
-                deduped.append((path, size))
+                deduped.append((path, size, category))
 
         return deduped
 
@@ -1088,9 +1093,9 @@ class AppConfigCleaner:
         total_size_bytes = 0
         logger.info("Potential orphaned application configurations found:")
 
-        for path, size_bytes in orphaned_configs:
+        for path, size_bytes, category in orphaned_configs:
             size_str = format_size_bytes(size_bytes)
-            logger.info(f"  {path} ({size_str})")
+            logger.info(f"  [{category}] {path} ({size_str})")
             total_size_bytes += size_bytes
 
         logger.info(f"Total size: {format_size_bytes(total_size_bytes)}")
@@ -1138,7 +1143,7 @@ class AppConfigCleaner:
                 logger.info("Keeping all orphaned configurations")
                 return
 
-            for path, _ in orphaned_configs:
+            for path, _, _ in orphaned_configs:
                 if path.exists() or path.is_symlink():
                     response = safe_input(
                         f"Remove {path}?", ["y", "n", ""], default="n"
@@ -1284,7 +1289,7 @@ class SystemCleanup:
         dry_run: bool = True,
         deep_scan: bool = False,
         dialog_callback: Optional[
-            Callable[[List[Tuple[Path, int]]], List[Path]]
+            Callable[[List[Tuple[Path, int, str]]], List[Path]]
         ] = None,
     ) -> None:
         self.dry_run = dry_run
@@ -1936,15 +1941,16 @@ class ScrollableFrame(tk.Frame):
 
 
 class AppConfigsDialog:
-    """Dialog for selecting app configurations to clean."""
+    """Dialog for selecting app configurations to clean using a Treeview."""
 
-    def __init__(self, parent: tk.Tk, configs: List[Tuple[Path, int]]):
+    def __init__(self, parent: tk.Tk, configs: List[Tuple[Path, int, str]]):
         self.top = tk.Toplevel(parent)
         self.top.title("Select App Configs to Clean")
-        self.top.geometry("600x400")
-        self.top.minsize(540, 360)
+        self.top.geometry("750x500")
+        self.top.minsize(600, 400)
         self.top.resizable(True, True)
         self.selected_configs: List[Path] = []
+        self.item_paths: Dict[str, Path] = {}
 
         # Make dialog modal
         self.top.transient(parent)
@@ -1954,37 +1960,75 @@ class AppConfigsDialog:
         main_frame = ttk.Frame(self.top, padding=10)
         main_frame.pack(fill="both", expand=True)
 
-        # Create style for white background checkboxes
-        style = ttk.Style()
-        style.configure("White.TCheckbutton", background="white")
-
         # Instructions
         ttk.Label(
             main_frame, text="Select the application configurations to remove:"
         ).pack(anchor="w", pady=(0, 10))
 
-        # Frame for scrollable area
-        scroll_container = tk.Frame(
-            main_frame, borderwidth=1, relief="solid", bg="white"
+        # Treeview frame with scrollbars
+        tree_frame = ttk.Frame(main_frame)
+        tree_frame.pack(fill="both", expand=True)
+
+        self.tree = ttk.Treeview(
+            tree_frame,
+            columns=("select", "path", "size"),
+            show="tree headings",
+            selectmode="none",
         )
-        scroll_container.pack(fill="both", expand=True, padx=1, pady=1)
 
-        # Scrollable frame for checkboxes
-        scroll_frame = ScrollableFrame(scroll_container)
-        scroll_frame.pack(fill="both", expand=True)
+        # Define columns
+        self.tree.heading("#0", text="Category / Item", anchor="w")
+        self.tree.heading("select", text="Select", anchor="center")
+        self.tree.heading("path", text="Path", anchor="w")
+        self.tree.heading("size", text="Size", anchor="e")
 
-        self.check_vars = []
-        for path, size_bytes in configs:
-            var = tk.BooleanVar(value=False)
-            self.check_vars.append((var, path))
-            size_str = format_size_bytes(size_bytes)
-            chk = ttk.Checkbutton(
-                scroll_frame.scrollable_frame,
-                text=f"{path} ({size_str})",
-                variable=var,
-                style="White.TCheckbutton",
+        self.tree.column("#0", width=250, minwidth=150)
+        self.tree.column("select", width=60, minwidth=60, anchor="center")
+        self.tree.column("path", width=300, minwidth=200)
+        self.tree.column("size", width=80, minwidth=60, anchor="e")
+
+        # Scrollbars
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
+
+        # Group configs by category
+        categories: Dict[str, List[Tuple[Path, int]]] = {}
+        for path, size, category in configs:
+            categories.setdefault(category, []).append((path, size))
+
+        for category, items in sorted(categories.items()):
+            cat_node = self.tree.insert(
+                "",
+                "end",
+                text=category,
+                values=("☐", "", ""),
+                tags=("category",),
+                open=True,
             )
-            chk.pack(anchor="w", pady=2)
+            for path, size in sorted(items, key=lambda x: str(x[0]).lower()):
+                item_id = self.tree.insert(
+                    cat_node,
+                    "end",
+                    text=path.name,
+                    values=("☐", str(path), format_size_bytes(size)),
+                    tags=("item",),
+                )
+                self.item_paths[item_id] = path
+
+        # Style category rows with bold font
+        self.tree.tag_configure("category", font=("", 10, "bold"))
+
+        # Bind click and keyboard events
+        self.tree.bind("<ButtonRelease-1>", self.on_tree_click)
+        self.tree.bind("<space>", self.on_space_key)
 
         # Buttons
         button_frame = ttk.Frame(main_frame)
@@ -1996,7 +2040,6 @@ class AppConfigsDialog:
             command=self.select_all,
             width=11,
             cursor="hand2",
-            style="Bold.TButton",
         ).pack(side="left", padx=5)
         ttk.Button(
             button_frame,
@@ -2004,7 +2047,6 @@ class AppConfigsDialog:
             command=self.deselect_all,
             width=11,
             cursor="hand2",
-            style="Bold.TButton",
         ).pack(side="left", padx=5)
         ttk.Button(
             button_frame,
@@ -2012,7 +2054,6 @@ class AppConfigsDialog:
             command=self.on_ok,
             width=11,
             cursor="hand2",
-            style="Bold.TButton",
         ).pack(side="right", padx=5)
         ttk.Button(
             button_frame,
@@ -2020,7 +2061,6 @@ class AppConfigsDialog:
             command=self.on_cancel,
             width=11,
             cursor="hand2",
-            style="Bold.TButton",
         ).pack(side="right", padx=5)
 
         # Bind Enter/Escape
@@ -2041,22 +2081,94 @@ class AppConfigsDialog:
         )
         self.top.geometry(f"+{x}+{y}")
 
-    def select_all(self):
+    def on_tree_click(self, event: tk.Event) -> None:
+        """Handles mouse clicks on treeview rows to toggle checkboxes."""
+        region = self.tree.identify_region(event.x, event.y)
+        if region not in ("tree", "cell"):
+            return
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
+        tags = self.tree.item(item, "tags")
+        if "category" in tags:
+            self.toggle_category(item)
+        elif "item" in tags:
+            self.toggle_item(item)
+
+    def on_space_key(self, event: tk.Event) -> None:
+        """Handles Space key to toggle focused row."""
+        item = self.tree.focus()
+        if not item:
+            return
+        tags = self.tree.item(item, "tags")
+        if "category" in tags:
+            self.toggle_category(item)
+        elif "item" in tags:
+            self.toggle_item(item)
+
+    def toggle_item(self, item: str) -> None:
+        """Toggles the checkbox state of a single item."""
+        values = list(self.tree.item(item, "values"))
+        values[0] = "☑" if values[0] == "☐" else "☐"
+        self.tree.item(item, values=tuple(values))
+        self.update_category_state(self.tree.parent(item))
+
+    def toggle_category(self, cat_item: str) -> None:
+        """Toggles the checkbox state of a category and all its children."""
+        values = list(self.tree.item(cat_item, "values"))
+        new_state = "☑" if values[0] == "☐" else "☐"
+        values[0] = new_state
+        self.tree.item(cat_item, values=tuple(values))
+        for child in self.tree.get_children(cat_item):
+            cvalues = list(self.tree.item(child, "values"))
+            cvalues[0] = new_state
+            self.tree.item(child, values=tuple(cvalues))
+
+    def update_category_state(self, cat_item: str) -> None:
+        """Updates category checkbox to reflect mixed/fully-checked children."""
+        if not cat_item:
+            return
+        children = self.tree.get_children(cat_item)
+        if not children:
+            return
+        states = [self.tree.item(c, "values")[0] for c in children]
+        if all(s == "☑" for s in states):
+            self.tree.item(cat_item, values=("☑", "", ""))
+        elif all(s == "☐" for s in states):
+            self.tree.item(cat_item, values=("☐", "", ""))
+        else:
+            # Mixed state - show as unchecked (or could use a half-check symbol)
+            self.tree.item(cat_item, values=("☐", "", ""))
+
+    def select_all(self) -> None:
         """Selects all configuration items."""
-        for var, _ in self.check_vars:
-            var.set(True)
+        for cat in self.tree.get_children(""):
+            self.tree.item(cat, values=("☑", "", ""))
+            for child in self.tree.get_children(cat):
+                values = list(self.tree.item(child, "values"))
+                values[0] = "☑"
+                self.tree.item(child, values=tuple(values))
 
-    def deselect_all(self):
+    def deselect_all(self) -> None:
         """Deselects all configuration items."""
-        for var, _ in self.check_vars:
-            var.set(False)
+        for cat in self.tree.get_children(""):
+            self.tree.item(cat, values=("☐", "", ""))
+            for child in self.tree.get_children(cat):
+                values = list(self.tree.item(child, "values"))
+                values[0] = "☐"
+                self.tree.item(child, values=tuple(values))
 
-    def on_ok(self):
+    def on_ok(self) -> None:
         """Handles OK button click, saving selection."""
-        self.selected_configs = [path for var, path in self.check_vars if var.get()]
+        self.selected_configs = []
+        for cat in self.tree.get_children(""):
+            for child in self.tree.get_children(cat):
+                values = self.tree.item(child, "values")
+                if values[0] == "☑":
+                    self.selected_configs.append(self.item_paths[child])
         self.top.destroy()
 
-    def on_cancel(self):
+    def on_cancel(self) -> None:
         """Handles Cancel button click, clearing selection."""
         self.selected_configs = []
         self.top.destroy()
@@ -2332,7 +2444,9 @@ class CleanupApp:
             pass
         self.root.after(100, self.process_dialogs)
 
-    def request_app_configs_dialog(self, configs: List[Tuple[Path, int]]) -> List[Path]:
+    def request_app_configs_dialog(
+        self, configs: List[Tuple[Path, int, str]]
+    ) -> List[Path]:
         """Requests app configs selection dialog from background thread."""
         logger.info(f"Requesting app configs dialog with {len(configs)} items")
         self.pending_dialogs.put(("app_configs", configs))
@@ -2340,7 +2454,9 @@ class CleanupApp:
         logger.info(f"Dialog returned {len(selected)} selected configs")
         return selected
 
-    def _show_app_configs_dialog(self, configs: List[Tuple[Path, int]]) -> List[Path]:
+    def _show_app_configs_dialog(
+        self, configs: List[Tuple[Path, int, str]]
+    ) -> List[Path]:
         """Shows dialog for selecting app configurations to clean."""
         logger.info(f"Showing app configs dialog with {len(configs)} items")
         dialog = AppConfigsDialog(self.root, configs)
