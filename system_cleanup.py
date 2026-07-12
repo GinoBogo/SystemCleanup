@@ -2004,6 +2004,8 @@ class AppConfigsDialog:
         for path, size, category in configs:
             categories.setdefault(category, []).append((path, size))
 
+        home = Path.home()
+
         for category, items in sorted(categories.items()):
             cat_node = self.tree.insert(
                 "",
@@ -2013,15 +2015,57 @@ class AppConfigsDialog:
                 tags=("category",),
                 open=True,
             )
+
+            # Maps a chain of path components (relative to $HOME, when possible)
+            # to the tree item id already created for it. This lets multiple
+            # entries that share an ancestor directory (e.g. two orphaned
+            # subdirectories under the same app folder) reuse the same
+            # intermediate node instead of collapsing the whole hierarchy
+            # into a flat category -> item list.
+            node_cache: Dict[Tuple[str, ...], str] = {}
+
             for path, size in sorted(items, key=lambda x: str(x[0]).lower()):
-                item_id = self.tree.insert(
-                    cat_node,
-                    "end",
-                    text=path.name,
-                    values=("☐", str(path), format_size_bytes(size)),
-                    tags=("item",),
-                )
-                self.item_paths[item_id] = path
+                try:
+                    rel_parts = path.relative_to(home).parts
+                except ValueError:
+                    rel_parts = path.parts
+
+                if not rel_parts:
+                    rel_parts = (path.name,)
+
+                parent_node = cat_node
+                built_parts: Tuple[str, ...] = ()
+
+                for depth, part in enumerate(rel_parts):
+                    built_parts = built_parts + (part,)
+                    is_leaf = depth == len(rel_parts) - 1
+
+                    cached = node_cache.get(built_parts)
+                    if cached is not None:
+                        parent_node = cached
+                        continue
+
+                    if is_leaf:
+                        node_id = self.tree.insert(
+                            parent_node,
+                            "end",
+                            text=part,
+                            values=("☐", str(path), format_size_bytes(size)),
+                            tags=("item",),
+                        )
+                        self.item_paths[node_id] = path
+                    else:
+                        node_id = self.tree.insert(
+                            parent_node,
+                            "end",
+                            text=part,
+                            values=("☐", "", ""),
+                            tags=("category",),
+                            open=True,
+                        )
+
+                    node_cache[built_parts] = node_id
+                    parent_node = node_id
 
         # Style category rows with bold font
         self.tree.tag_configure("category", font=("", 10, "bold"))
@@ -2089,83 +2133,78 @@ class AppConfigsDialog:
         item = self.tree.identify_row(event.y)
         if not item:
             return
-        tags = self.tree.item(item, "tags")
-        if "category" in tags:
-            self.toggle_category(item)
-        elif "item" in tags:
-            self.toggle_item(item)
+        self.toggle_node(item)
 
     def on_space_key(self, event: tk.Event) -> None:
         """Handles Space key to toggle focused row."""
         item = self.tree.focus()
         if not item:
             return
-        tags = self.tree.item(item, "tags")
-        if "category" in tags:
-            self.toggle_category(item)
-        elif "item" in tags:
-            self.toggle_item(item)
+        self.toggle_node(item)
 
-    def toggle_item(self, item: str) -> None:
-        """Toggles the checkbox state of a single item."""
+    def _descendants(self, item: str) -> List[str]:
+        """Returns all descendant item ids of a node, at any depth."""
+        descendants: List[str] = []
+        for child in self.tree.get_children(item):
+            descendants.append(child)
+            descendants.extend(self._descendants(child))
+        return descendants
+
+    def _set_checked(self, item: str, state: str) -> None:
+        """Sets the checkbox column of a node without touching path/size."""
         values = list(self.tree.item(item, "values"))
-        values[0] = "☑" if values[0] == "☐" else "☐"
+        values[0] = state
         self.tree.item(item, values=tuple(values))
-        self.update_category_state(self.tree.parent(item))
 
-    def toggle_category(self, cat_item: str) -> None:
-        """Toggles the checkbox state of a category and all its children."""
-        values = list(self.tree.item(cat_item, "values"))
+    def toggle_node(self, item: str) -> None:
+        """Toggles a node's checkbox, cascading to all descendants (any depth)
+        and updating every ancestor (category or intermediate folder) above it."""
+        values = self.tree.item(item, "values")
         new_state = "☑" if values[0] == "☐" else "☐"
-        values[0] = new_state
-        self.tree.item(cat_item, values=tuple(values))
-        for child in self.tree.get_children(cat_item):
-            cvalues = list(self.tree.item(child, "values"))
-            cvalues[0] = new_state
-            self.tree.item(child, values=tuple(cvalues))
+        self._set_checked(item, new_state)
+        for descendant in self._descendants(item):
+            self._set_checked(descendant, new_state)
+        self._update_ancestors(self.tree.parent(item))
 
-    def update_category_state(self, cat_item: str) -> None:
-        """Updates category checkbox to reflect mixed/fully-checked children."""
-        if not cat_item:
-            return
-        children = self.tree.get_children(cat_item)
-        if not children:
-            return
-        states = [self.tree.item(c, "values")[0] for c in children]
-        if all(s == "☑" for s in states):
-            self.tree.item(cat_item, values=("☑", "", ""))
-        elif all(s == "☐" for s in states):
-            self.tree.item(cat_item, values=("☐", "", ""))
-        else:
-            # Mixed state - show as unchecked (or could use a half-check symbol)
-            self.tree.item(cat_item, values=("☐", "", ""))
+    def _update_ancestors(self, item: str) -> None:
+        """Walks up the full ancestor chain, updating each folder/category
+        node to reflect whether its children are fully, partially, or not
+        checked. Works for any nesting depth, not just a single parent."""
+        while item:
+            children = self.tree.get_children(item)
+            if children:
+                states = [self.tree.item(c, "values")[0] for c in children]
+                if all(s == "☑" for s in states):
+                    self._set_checked(item, "☑")
+                else:
+                    # All-unchecked or mixed both render as unchecked
+                    # (tk.ttk.Treeview has no built-in tristate glyph here).
+                    self._set_checked(item, "☐")
+            item = self.tree.parent(item)
 
     def select_all(self) -> None:
-        """Selects all configuration items."""
-        for cat in self.tree.get_children(""):
-            self.tree.item(cat, values=("☑", "", ""))
-            for child in self.tree.get_children(cat):
-                values = list(self.tree.item(child, "values"))
-                values[0] = "☑"
-                self.tree.item(child, values=tuple(values))
+        """Selects all configuration items, at every level of the hierarchy."""
+        for item in self._descendants(""):
+            self._set_checked(item, "☑")
 
     def deselect_all(self) -> None:
-        """Deselects all configuration items."""
-        for cat in self.tree.get_children(""):
-            self.tree.item(cat, values=("☐", "", ""))
-            for child in self.tree.get_children(cat):
-                values = list(self.tree.item(child, "values"))
-                values[0] = "☐"
-                self.tree.item(child, values=tuple(values))
+        """Deselects all configuration items, at every level of the hierarchy."""
+        for item in self._descendants(""):
+            self._set_checked(item, "☐")
 
     def on_ok(self) -> None:
-        """Handles OK button click, saving selection."""
+        """Handles OK button click, saving selection.
+
+        Walks the entire tree recursively (not just two levels deep) so that
+        checked leaf items nested under intermediate folder nodes are still
+        collected.
+        """
         self.selected_configs = []
-        for cat in self.tree.get_children(""):
-            for child in self.tree.get_children(cat):
-                values = self.tree.item(child, "values")
+        for item in self._descendants(""):
+            if item in self.item_paths:
+                values = self.tree.item(item, "values")
                 if values[0] == "☑":
-                    self.selected_configs.append(self.item_paths[child])
+                    self.selected_configs.append(self.item_paths[item])
         self.top.destroy()
 
     def on_cancel(self) -> None:
