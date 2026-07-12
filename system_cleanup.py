@@ -42,6 +42,145 @@ logging.addLevelName(STEP, "STEP")
 gui_input_handler = None  # Global input handler for GUI mode
 
 
+class GScaling:
+    """Utility class for detecting display scaling factor on Linux.
+
+    Provides Linux-specific display DPI scaling factor detection for GUI applications.
+
+    Detection strategy:
+      - Environment variables (GDK_SCALE, QT_SCALE_FACTOR)
+      - GNOME gsettings integer scaling
+      - X11 Xft.dpi via xrdb
+      - Tk's winfo_fpixels as fallback
+      Works best-effort under both X11 and Wayland.
+
+    The module never raises: any detection failure is caught, logged at DEBUG level,
+    and the chain simply moves on to the next method, ultimately defaulting to 1.0
+    ("no scaling detected") if nothing else succeeds.
+    """
+
+    _scale_factor = None
+    _detection_method = None
+    DEFAULT_DPI = 96.0
+    SUBPROCESS_TIMEOUT = 1.0
+
+    @classmethod
+    def get_scale_factor(cls, master=None, force_refresh=False):
+        """
+        Get display scaling factor using Linux-specific methods.
+
+        Args:
+            master: Optional parent widget for per-window/per-monitor detection.
+            force_refresh: If True, ignore cached value and re-detect.
+
+        Returns:
+            Scale factor (e.g., 1.0 for 100%, 1.33 for 133%, 1.5 for 150%).
+        """
+        if cls._scale_factor is not None and not force_refresh:
+            return cls._scale_factor
+
+        detected = cls._detect_linux(master)
+
+        if detected is None:
+            scale_factor, method = 1.0, "default (no detection method succeeded)"
+        else:
+            scale_factor, method = detected
+
+        # Sanity-guard against garbage values
+        if not (0.5 <= scale_factor <= 4.0):
+            logger.debug(
+                "Detected scale factor %.3f via %s is out of sane bounds, resetting to 1.0",
+                scale_factor,
+                method,
+            )
+            scale_factor, method = 1.0, "default (out-of-range value discarded)"
+
+        cls._scale_factor = scale_factor
+        cls._detection_method = method
+        logger.debug("Scale factor resolved to %.3f via %s", scale_factor, method)
+        return cls._scale_factor
+
+    @staticmethod
+    def _detect_linux(master):
+        """Detect scaling factor on Linux systems."""
+        # GDK_SCALE env var
+        gdk_scale = os.environ.get("GDK_SCALE")
+        if gdk_scale:
+            try:
+                return (float(gdk_scale), "env GDK_SCALE")
+            except ValueError:
+                pass
+
+        # QT_SCALE_FACTOR env var
+        qt_scale = os.environ.get("QT_SCALE_FACTOR")
+        if qt_scale:
+            try:
+                return (float(qt_scale), "env QT_SCALE_FACTOR")
+            except ValueError:
+                pass
+
+        # GNOME gsettings integer scaling
+        try:
+            result = subprocess.run(
+                ["gsettings", "get", "org.gnome.desktop.interface", "scaling-factor"],
+                capture_output=True,
+                text=True,
+                timeout=GScaling.SUBPROCESS_TIMEOUT,
+            )
+            if result.returncode == 0:
+                parts = result.stdout.strip().split()
+                if parts:
+                    value = int(parts[-1])
+                    if value > 0:
+                        return (float(value), "gsettings scaling-factor")
+        except (
+            subprocess.SubprocessError,
+            OSError,
+            ValueError,
+            FileNotFoundError,
+        ) as e:
+            logger.debug("gsettings scaling-factor query failed: %s", e)
+
+        # X11 Xft.dpi via xrdb
+        try:
+            result = subprocess.run(
+                ["xrdb", "-query"],
+                capture_output=True,
+                text=True,
+                timeout=GScaling.SUBPROCESS_TIMEOUT,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.split("\n"):
+                    if line.startswith("Xft.dpi:"):
+                        try:
+                            xft_dpi = float(line.split(":")[1].strip())
+                            return (
+                                xft_dpi / GScaling.DEFAULT_DPI,
+                                "X11 Xft.dpi (xrdb)",
+                            )
+                        except (ValueError, IndexError):
+                            pass
+        except (subprocess.SubprocessError, OSError, FileNotFoundError) as e:
+            logger.debug("xrdb query failed: %s", e)
+
+        # Fallback to Tk's DPI report
+        try:
+            root = master.winfo_toplevel() if master is not None else tk._default_root
+            if root is not None:
+                dpi = root.winfo_fpixels("1i")
+                detected_scale = dpi / GScaling.DEFAULT_DPI
+                if detected_scale > 1.05 or detected_scale < 0.95:
+                    return (detected_scale, "Tk winfo_fpixels")
+        except Exception as e:
+            logger.debug("Tk winfo_fpixels query failed on Linux: %s", e)
+
+        return None
+
+
+# Global DPI scaling factor
+_dpi_scaling = GScaling.get_scale_factor()
+
+
 # ==============================================================================
 # UTILITY FUNCTIONS
 # ==============================================================================
@@ -1946,8 +2085,13 @@ class AppConfigsDialog:
     def __init__(self, parent: tk.Tk, configs: List[Tuple[Path, int, str]]):
         self.top = tk.Toplevel(parent)
         self.top.title("Select App Configs to Clean")
-        self.top.geometry("750x500")
-        self.top.minsize(600, 400)
+        # Scale geometry and minsize by DPI factor
+        width = int(800 * _dpi_scaling)
+        height = int(500 * _dpi_scaling)
+        min_width = int(600 * _dpi_scaling)
+        min_height = int(400 * _dpi_scaling)
+        self.top.geometry(f"{width}x{height}")
+        self.top.minsize(min_width, min_height)
         self.top.resizable(True, True)
         self.selected_configs: List[Path] = []
         self.item_paths: Dict[str, Path] = {}
@@ -1957,13 +2101,13 @@ class AppConfigsDialog:
         self.top.grab_set()
 
         # Main frame
-        main_frame = ttk.Frame(self.top, padding=10)
+        main_frame = ttk.Frame(self.top, padding=int(10 * _dpi_scaling))
         main_frame.pack(fill="both", expand=True)
 
         # Instructions
         ttk.Label(
             main_frame, text="Select the application configurations to remove:"
-        ).pack(anchor="w", pady=(0, 10))
+        ).pack(anchor="w", pady=(0, int(10 * _dpi_scaling)))
 
         # Treeview frame with scrollbars
         tree_frame = ttk.Frame(main_frame)
@@ -1976,16 +2120,36 @@ class AppConfigsDialog:
             selectmode="none",
         )
 
+        # Scale row height by DPI factor using ttk Style
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Treeview", rowheight=int(20 * _dpi_scaling))
+
         # Define columns
         self.tree.heading("#0", text="Category / Item", anchor="w")
         self.tree.heading("select", text="Select", anchor="center")
         self.tree.heading("path", text="Path", anchor="w")
         self.tree.heading("size", text="Size", anchor="e")
 
-        self.tree.column("#0", width=250, minwidth=150)
-        self.tree.column("select", width=60, minwidth=60, anchor="center")
-        self.tree.column("path", width=300, minwidth=200)
-        self.tree.column("size", width=80, minwidth=60, anchor="e")
+        # Scale column widths by DPI factor
+        self.tree.column(
+            "#0", width=int(250 * _dpi_scaling), minwidth=int(150 * _dpi_scaling)
+        )
+        self.tree.column(
+            "select",
+            width=int(60 * _dpi_scaling),
+            minwidth=int(60 * _dpi_scaling),
+            anchor="center",
+        )
+        self.tree.column(
+            "path", width=int(300 * _dpi_scaling), minwidth=int(200 * _dpi_scaling)
+        )
+        self.tree.column(
+            "size",
+            width=int(80 * _dpi_scaling),
+            minwidth=int(60 * _dpi_scaling),
+            anchor="e",
+        )
 
         # Scrollbars
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
@@ -2076,7 +2240,7 @@ class AppConfigsDialog:
 
         # Buttons
         button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill="x", pady=(10, 0))
+        button_frame.pack(fill="x", pady=(int(10 * _dpi_scaling), 0))
 
         ttk.Button(
             button_frame,
@@ -2084,28 +2248,28 @@ class AppConfigsDialog:
             command=self.select_all,
             width=11,
             cursor="hand2",
-        ).pack(side="left", padx=5)
+        ).pack(side="left", padx=int(5 * _dpi_scaling))
         ttk.Button(
             button_frame,
             text="Deselect All",
             command=self.deselect_all,
             width=11,
             cursor="hand2",
-        ).pack(side="left", padx=5)
+        ).pack(side="left", padx=int(5 * _dpi_scaling))
         ttk.Button(
             button_frame,
             text="OK",
             command=self.on_ok,
             width=11,
             cursor="hand2",
-        ).pack(side="right", padx=5)
+        ).pack(side="right", padx=int(5 * _dpi_scaling))
         ttk.Button(
             button_frame,
             text="Cancel",
             command=self.on_cancel,
             width=11,
             cursor="hand2",
-        ).pack(side="right", padx=5)
+        ).pack(side="right", padx=int(5 * _dpi_scaling))
 
         # Bind Enter/Escape
         self.top.bind("<Return>", lambda e: self.on_ok())
@@ -2224,7 +2388,13 @@ class CleanupApp:
         self.config_file = Path(__file__).resolve().parent / "system_cleanup.json"
         self.config = self.load_config()
 
-        geometry = self.config.get("geometry", "800x600")
+        # Scale default geometry by DPI factor
+        if "geometry" in self.config:
+            geometry = self.config["geometry"]
+        else:
+            width = int(800 * _dpi_scaling)
+            height = int(600 * _dpi_scaling)
+            geometry = f"{width}x{height}"
         self.root.geometry(geometry)
 
         # Set global gui_input_handler immediately to avoid circular dependency
@@ -2311,8 +2481,12 @@ class CleanupApp:
     def setup_user_interface(self) -> None:
         """Sets up all GUI components and layout."""
         # Options Frame
-        options_frame = ttk.LabelFrame(self.root, text="Cleanup Options", padding=10)
-        options_frame.pack(fill="x", padx=10, pady=5)
+        options_frame = ttk.LabelFrame(
+            self.root, text="Cleanup Options", padding=int(10 * _dpi_scaling)
+        )
+        options_frame.pack(
+            fill="x", padx=int(10 * _dpi_scaling), pady=int(5 * _dpi_scaling)
+        )
 
         top_options_frame = ttk.Frame(options_frame)
         top_options_frame.pack(fill="x")
@@ -2323,16 +2497,18 @@ class CleanupApp:
             text="Dry Run (Simulate only)",
             variable=self.dry_run_var,
             command=self.on_dry_run_toggle,
-        ).pack(side="left", padx=10, pady=5)
+        ).pack(side="left", padx=int(10 * _dpi_scaling), pady=int(5 * _dpi_scaling))
 
         self.deep_scan_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             top_options_frame,
             text="Deep Scan Mode (Slow)",
             variable=self.deep_scan_var,
-        ).pack(side="left", padx=10, pady=5)
+        ).pack(side="left", padx=int(10 * _dpi_scaling), pady=int(5 * _dpi_scaling))
 
-        ttk.Separator(options_frame, orient="horizontal").pack(fill="x", pady=5)
+        ttk.Separator(options_frame, orient="horizontal").pack(
+            fill="x", pady=int(5 * _dpi_scaling)
+        )
 
         # Task checkboxes
         self.tasks = {
@@ -2352,7 +2528,11 @@ class CleanupApp:
         for task_key, task_var in self.tasks.items():
             label = task_key.replace("_", " ").title()
             ttk.Checkbutton(task_frame, text=label, variable=task_var).grid(
-                row=row, column=column, sticky="w", padx=10, pady=5
+                row=row,
+                column=column,
+                sticky="w",
+                padx=int(10 * _dpi_scaling),
+                pady=int(5 * _dpi_scaling),
             )
             column += 1
             if column > 2:
@@ -2360,7 +2540,7 @@ class CleanupApp:
                 row += 1
 
         # Button Frame
-        button_frame = ttk.Frame(self.root, padding=5)
+        button_frame = ttk.Frame(self.root, padding=int(5 * _dpi_scaling))
         button_frame.pack(side="bottom", fill="x")
 
         button_container = ttk.Frame(button_frame)
@@ -2374,7 +2554,9 @@ class CleanupApp:
             cursor="hand2",
             style="Bold.TButton",
         )
-        self.start_button.pack(side="left", padx=5, pady=5)
+        self.start_button.pack(
+            side="left", padx=int(5 * _dpi_scaling), pady=int(5 * _dpi_scaling)
+        )
 
         ttk.Button(
             button_container,
@@ -2383,11 +2565,13 @@ class CleanupApp:
             width=11,
             cursor="hand2",
             style="Bold.TButton",
-        ).pack(side="left", padx=5, pady=5)
+        ).pack(side="left", padx=int(5 * _dpi_scaling), pady=int(5 * _dpi_scaling))
 
         # Log Area
-        log_frame = ttk.LabelFrame(self.root, text="Log Output", padding=5)
-        log_frame.pack(fill="both", expand=True, padx=10)
+        log_frame = ttk.LabelFrame(
+            self.root, text="Log Output", padding=int(5 * _dpi_scaling)
+        )
+        log_frame.pack(fill="both", expand=True, padx=int(10 * _dpi_scaling))
 
         self.log_text = tk.Text(
             log_frame,
